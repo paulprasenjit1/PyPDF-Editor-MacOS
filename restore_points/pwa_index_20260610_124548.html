@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Strict Content-Security-Policy: only same-origin code runs. Everything is
+     vendored, so no third-party scripts, no inline scripts, and no network
+     egress are permitted. 'wasm-unsafe-eval' is required to instantiate the
+     MuPDF WebAssembly engine; blob:/data: cover locally generated page images
+     and signatures. This neutralises injected-script attacks. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' 'wasm-unsafe-eval';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' blob: data:;
+  font-src 'self';
+  connect-src 'self' blob: data:;
+  worker-src 'self' blob:;
+  manifest-src 'self';
+  base-uri 'none';
+  form-action 'none';
+  object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<title>PyPDF Editor</title>
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PyPDF Editor">
+<link rel="apple-touch-icon" href="./icon-180.png">
+<link rel="icon" href="./icon-192.png">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e9ef; --muted:#8b93a3;
+          --accent:#4f8cff; --accent2:#1f6feb; --ok:#3fb950; --warn:#d29922; --err:#f85149; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--txt); display:flex; flex-direction:column;
+         height:100dvh; overflow:hidden; }
+  header { display:flex; align-items:center; gap:10px; padding:max(8px,env(safe-area-inset-top)) 14px 8px;
+           background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .meta { color:var(--muted); font-size:11px; margin-left:auto; text-align:right; max-width:55%;
+                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .toolbar { display:flex; flex-wrap:nowrap; gap:5px; padding:8px 8px; background:var(--panel);
+             border-bottom:1px solid var(--line); align-items:center; overflow-x:auto; }
+  .toolbar > * { flex:0 0 auto; white-space:nowrap; }
+  .toolbar::-webkit-scrollbar { height:6px; }
+  .toolbar::-webkit-scrollbar-thumb { background:var(--line); border-radius:3px; }
+  button { background:var(--accent2); color:#fff; border:0; border-radius:8px; padding:9px 10px;
+           font-size:13px; cursor:pointer; }
+  button:active { background:var(--accent); }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
+  button.on { background:var(--ok); }
+  button:disabled { opacity:.4; }
+  select.lvl { background:var(--bg); color:var(--txt); border:1px solid var(--line);
+               border-radius:8px; padding:8px 4px; font-size:13px; width:74px; }
+  .zoomctl { display:flex; align-items:center; gap:2px; border:1px solid var(--line);
+             border-radius:8px; padding:2px; }
+  .zoomctl button { padding:6px 9px; }
+  .zlbl { font-size:12px; color:var(--txt); min-width:42px; text-align:center; }
+  .viewer { flex:1; overflow:auto; padding:18px 12px calc(18px + env(safe-area-inset-bottom));
+            display:flex; flex-direction:column; gap:18px; -webkit-overflow-scrolling:touch; align-items:safe center; }
+  .viewer::-webkit-scrollbar { width:12px; height:12px; }
+  .viewer::-webkit-scrollbar-track { background:#0b0d12; }
+  .viewer::-webkit-scrollbar-thumb { background:#3d6fd6; border-radius:7px; border:3px solid #0b0d12; }
+  /* content-visibility:auto lets the browser skip rendering offscreen pages
+     entirely — a big CPU/GPU/battery win on long PDFs. contain-intrinsic-size
+     is set per-stage in JS so scrollbar/layout stay stable. */
+  .stage { position:relative; box-shadow:0 6px 24px rgba(0,0,0,.55); background:#fff;
+           content-visibility:auto; }
+  .stage .plabel { position:absolute; top:4px; left:4px; font-size:10px; color:#fff;
+           background:rgba(0,0,0,.45); padding:1px 6px; border-radius:5px; z-index:2; }
+  .stage img { display:block; width:100%; height:auto; }
+  /* Overlay never blocks scrolling — it only catches input while drawing a
+     signature box (sign mode). In view / text mode touches fall through to the
+     scroll container so pages scroll freely. */
+  .stage .ovl { position:absolute; inset:0; pointer-events:none; }
+  .stage.placing .ovl { cursor:crosshair; touch-action:none; pointer-events:auto; }
+  .selrect { position:absolute; border:1.5px dashed var(--ok); background:rgba(63,185,80,.18); }
+  /* text-edit span boxes (only visible/tappable in text mode); pan-y keeps
+     vertical scrolling working even when a swipe starts on a span. */
+  .span { position:absolute; display:none; border:1px solid rgba(79,140,255,.0);
+          border-radius:2px; pointer-events:none; }
+  .viewer.textmode .span { display:block; pointer-events:auto; touch-action:pan-y;
+          border-color:rgba(79,140,255,.45); background:rgba(79,140,255,.10); }
+  .viewer.textmode .span:active { background:rgba(79,140,255,.30); }
+  .empty { color:var(--muted); text-align:center; margin:auto; font-size:14px; line-height:1.7; padding:24px; }
+  .status { font-size:12px; padding:8px 14px calc(8px + env(safe-area-inset-bottom));
+            border-top:1px solid var(--line); background:var(--panel); color:var(--muted); min-height:18px; }
+  .status.ok { color:var(--ok); } .status.err { color:var(--err); } .status.warn { color:var(--warn); }
+  .sheet-bg { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:flex-end; z-index:80; }
+  .sheet-bg.show { display:flex; }
+  .sheet { background:var(--panel); width:100%; border-top-left-radius:16px; border-top-right-radius:16px;
+           border-top:1px solid var(--line); padding:16px 16px calc(20px + env(safe-area-inset-bottom));
+           max-height:82dvh; overflow:auto; }
+  .sheet h3 { margin:0 0 10px; font-size:15px; }
+  .sheet .row { display:flex; gap:8px; align-items:center; margin:10px 0; flex-wrap:wrap; }
+  .sheet label.ck { display:flex; gap:8px; align-items:center; font-size:14px; }
+  .sheet .full { width:100%; }
+  .sheet textarea { width:100%; min-height:84px; background:var(--bg); color:var(--txt);
+           border:1px solid var(--line); border-radius:8px; padding:10px; font-size:16px; resize:vertical; }
+  .sheet input[type=password]{ flex:1; background:var(--bg); color:var(--txt); border:1px solid var(--line);
+           border-radius:8px; padding:10px; font-size:16px; }
+  .hint { font-size:12px; color:var(--muted); line-height:1.5; }
+  .porow { display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--line); }
+  .porow img { width:46px; height:auto; background:#fff; border-radius:3px; }
+  .porow .pn { flex:1; font-size:14px; }
+  .porow.del { opacity:.4; text-decoration:line-through; }
+  .porow button { padding:7px 10px; }
+  input[type=file] { display:none; }
+  .spin { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+          background:rgba(0,0,0,.5); z-index:60; color:#fff; font-size:14px; text-align:center; padding:24px; }
+  .spin.show { display:flex; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PyPDF Editor</h1>
+  <div class="meta" id="meta">Loading engine…</div>
+</header>
+
+<div class="toolbar" id="toolbar">
+  <button id="openBtn" disabled>Open</button>
+  <button class="ghost" id="textBtn" disabled>Edit text</button>
+  <button class="ghost" id="undoBtn" disabled>Undo</button>
+  <div class="zoomctl">
+    <button class="ghost" id="zoomOut" disabled>−</button>
+    <span class="zlbl" id="zoomLbl">100%</span>
+    <button class="ghost" id="zoomIn" disabled>+</button>
+  </div>
+  <select id="compLevel" class="lvl" title="High &lt;1MB · Medium &lt;700KB · Low &lt;200KB" disabled>
+    <option value="high">High</option>
+    <option value="medium" selected>Medium</option>
+    <option value="low">Low</option>
+  </select>
+  <button class="ghost" id="compBtn" disabled>Compress</button>
+  <button class="ghost" id="moreBtn" disabled>More ▾</button>
+  <button id="saveBtn" disabled>Save</button>
+</div>
+
+<div class="viewer" id="viewer">
+  <div class="empty" id="emptyMsg">Starting the MuPDF engine…<br>This loads once, then works fully offline.</div>
+</div>
+
+<div class="status" id="status">Loading…</div>
+
+<input type="file" id="fileInput" accept="application/pdf,.pdf">
+<input type="file" id="mergeInput" accept="application/pdf,.pdf" multiple>
+<input type="file" id="imgInput" accept="image/*" multiple>
+<input type="file" id="sigInput" accept="image/*">
+
+<div class="sheet-bg" id="sheetBg"><div class="sheet" id="sheet"></div></div>
+<div class="spin" id="spin">Working…</div>
+
+<!-- pdf-lib (vendored, offline) — used as the "pen" to draw replacement text/images -->
+<script src="./vendor/pdf-lib.min.js"></script>
+
+<!-- MuPDF.js is the core engine; ESM module with WASM (vendored, offline) -->
+<!-- App logic lives in an external module so the CSP can forbid inline scripts -->
+<script type="module" src="./app.js"></script>
+</body>
+</html>
