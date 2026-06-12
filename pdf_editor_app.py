@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyPDF Editor - Local Web App
+PyPDF for Mac - Local Web App
 ============================
 
 A browser-based PDF editor. No tkinter, no PyQt, no native GUI toolkits.
@@ -34,6 +34,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import webbrowser
 from collections import OrderedDict
@@ -85,13 +86,24 @@ import fitz  # noqa
 
 PORT = 8080
 HOST = "127.0.0.1"
+APP_VERSION = "4.1"          # Retina-sharp rendering
+SERVER_STARTED = time.strftime("%Y-%m-%d %H:%M")
+
 UNDO_LIMIT = 15
+# Undo snapshots are full document copies; cap their TOTAL size too, so a huge
+# PDF can't pile up 15 multi-hundred-MB copies in memory.
+UNDO_MAX_BYTES = 120 * 1024 * 1024
 
 # Single-instance support: a launch first looks for an already-running editor on
 # one of these ports (identified by APP_TOKEN) and hands the new PDF to it
 # instead of starting a second server / browser tab.
 CANDIDATE_PORTS = [8080, 8081, 8082, 8090]
-APP_TOKEN = "pypdf-editor-v2"
+# The token is VERSIONED: a new build must never hand off to a server left
+# running by an older build (its browser tab would keep showing the old UI and
+# "broken" features). A mismatched old server is simply ignored — this launch
+# starts fresh on another port, and the old one shuts itself down once its
+# last tab closes.
+APP_TOKEN = "pypdf-editor-v" + APP_VERSION
 
 # Idle auto-shutdown: the browser tab sends a heartbeat every few seconds while
 # it is open. When every tab has been closed for IDLE_SHUTDOWN_SEC, the server
@@ -112,6 +124,7 @@ class State:
         self.epoch = 0   # bumped on every document change (cache key + tab sync)
         self.locked = False        # True when a password-protected PDF awaits a password
         self.locked_data = None    # raw encrypted bytes held until authenticated
+        self.dirty = False         # True when the document has changes not yet Saved
 
     def open_bytes(self, data, filename="document.pdf", path=""):
         doc = fitz.open(stream=data, filetype="pdf")
@@ -127,6 +140,7 @@ class State:
             self.filename = filename or "document.pdf"
             self.path = path or ""
             self.undo = []
+            self.dirty = False
             self.epoch += 1
             return
         self.doc = doc
@@ -135,6 +149,7 @@ class State:
         self.filename = filename or "document.pdf"
         self.path = path or ""
         self.undo = []
+        self.dirty = False
         self.epoch += 1
 
     def authenticate(self, password):
@@ -153,8 +168,23 @@ class State:
         self.locked = False
         self.locked_data = None
         self.undo = []
+        # The decrypted, password-free copy only exists in memory until Saved.
+        self.dirty = True
         self.epoch += 1
         return True
+
+    def close(self):
+        """Close the working document and release all memory it holds."""
+        if self.doc is not None:
+            self.doc.close()
+        self.doc = None
+        self.filename = "document.pdf"
+        self.path = ""
+        self.undo = []
+        self.locked = False
+        self.locked_data = None
+        self.dirty = False
+        self.epoch += 1
 
     def require(self):
         if self.doc is None:
@@ -165,15 +195,22 @@ class State:
         """Save the current document so the next change can be undone."""
         if self.doc is None:
             return
-        self.undo.append((label, self.doc.tobytes()))
+        self.undo.append((label, self.doc.tobytes(), self.filename))
         if len(self.undo) > UNDO_LIMIT:
             self.undo.pop(0)
+        # Cap by total memory as well as steps (always keep the newest snapshot).
+        total = sum(len(t[1]) for t in self.undo)
+        while len(self.undo) > 1 and total > UNDO_MAX_BYTES:
+            dropped = self.undo.pop(0)
+            total -= len(dropped[1])
 
     def pop_undo(self):
         if not self.undo:
             raise RuntimeError("Nothing to undo.")
-        label, data = self.undo.pop()
+        label, data, name = self.undo.pop()
         self.doc = fitz.open(stream=data, filetype="pdf")
+        # undoing a merge / images→PDF also restores the previous file name
+        self.filename = name
         return label
 
     def to_bytes(self, compress=False):
@@ -185,6 +222,46 @@ class State:
 
 
 STATE = State()
+
+
+# /api/state is called after every operation AND on every zoom/resize rebuild;
+# serialising the whole document each time just to show its size is the single
+# hottest wasted cost on large PDFs. Cache it per document version instead.
+_SIZE_CACHE = {"epoch": -1, "kb": 0.0}
+
+
+def doc_size_kb():
+    if _SIZE_CACHE["epoch"] != STATE.epoch:
+        _SIZE_CACHE["kb"] = round(len(STATE.to_bytes()) / 1024, 1)
+        _SIZE_CACHE["epoch"] = STATE.epoch
+    return _SIZE_CACHE["kb"]
+
+
+def safe_filename(name, fallback="document.pdf"):
+    """Sanitise a user-chosen download name: strip path separators and control
+    characters, refuse hidden/empty names, and ensure a .pdf extension."""
+    name = "".join(c for c in str(name or "") if c >= " " and c not in '/\\:')
+    name = name.strip().lstrip(".")
+    if not name:
+        return fallback
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    return name[:120]
+
+
+def friendly_error(e):
+    """Turn raw engine errors into plain language; keep already-human text."""
+    raw = str(e)
+    low = raw.lower()
+    if ("cannot open" in low or "format error" in low or "no objects found" in low
+            or "not a pdf" in low or "syntax error" in low
+            or "failed to open stream" in low or "cannot recognize" in low):
+        return "This file appears damaged, or isn't really a PDF."
+    if "password" in low and "incorrect" not in low and "unlock" not in low:
+        return "This PDF is password-protected. Use Unlock PDF to open it."
+    if "memory" in low:
+        return "This document is too large to process — try compressing it first."
+    return raw
 
 # ---------------------------------------------------------------------------
 # Font matching helpers (for text edits)
@@ -242,8 +319,9 @@ def render_page(page_num, zoom=None, target_w=None, fmt="png"):
         z = float(zoom or 1.5)
     pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
     if fmt == "jpeg":
-        # JPEG encodes far faster than PNG and transfers smaller -> quicker open
-        return pix.tobytes("jpeg", jpg_quality=82), pix.width, pix.height, "image/jpeg"
+        # JPEG encodes far faster than PNG and transfers smaller -> quicker open.
+        # Quality 90: visibly crisper text than the old 82, still compact.
+        return pix.tobytes("jpeg", jpg_quality=90), pix.width, pix.height, "image/jpeg"
     return pix.tobytes("png"), pix.width, pix.height, "image/png"
 
 
@@ -335,9 +413,12 @@ def merge_pdfs(files, include_current=False):
         src.close()
     if new.page_count == 0:
         raise RuntimeError("No pages to merge.")
+    # the merge replaces the open document — snapshot it first so Undo can
+    # bring it back
+    if STATE.doc is not None:
+        STATE.snapshot("merge")
     STATE.doc = new
     STATE.filename = "merged.pdf"
-    STATE.undo = []
 
 
 def unlock_pdf(data, filename="document.pdf", password=""):
@@ -431,11 +512,22 @@ def compress(level="medium"):
     return before, len(best), target_kb
 
 
-def create_from_images(images):
+def create_from_images(images, quality="normal"):
+    """Build a new PDF from images. quality="small" downscales each image to
+    ~1600px and re-encodes as JPEG — a much lighter file, same page sizes."""
     new = fitz.open()
     for _name, raw in images:
         img = fitz.open(stream=raw, filetype=None)
         rect = img[0].rect
+        if quality == "small":
+            scale = min(1.0, 1600.0 / max(rect.width, rect.height))
+            pm = img[0].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            jpg = pm.tobytes("jpeg", jpg_quality=72)
+            # only swap in the JPEG when it actually IS smaller (graphics-heavy
+            # PNGs can re-encode larger; photos shrink a lot)
+            if len(jpg) < len(raw):
+                img.close()
+                img = fitz.open(stream=jpg, filetype=None)
         pdfbytes = img.convert_to_pdf()
         img.close()
         imgpdf = fitz.open("pdf", pdfbytes)
@@ -444,9 +536,11 @@ def create_from_images(images):
         imgpdf.close()
     if new.page_count == 0:
         raise RuntimeError("No valid images provided.")
+    # replaces the open document — keep it one Undo away
+    if STATE.doc is not None:
+        STATE.snapshot("create from images")
     STATE.doc = new
     STATE.filename = "from_images.pdf"
-    STATE.undo = []
 
 
 def delete_pages(pages):
@@ -458,13 +552,42 @@ def delete_pages(pages):
     doc.delete_pages(pages)
 
 
-def reorder_pages(order):
+def reorder_pages(order, rotations=None):
+    """Apply a new page order, optional per-position rotations (degrees,
+    multiples of 90, aligned with `order`), and deletions — pages NOT listed
+    in `order` are removed. All one undoable step."""
     doc = STATE.require()
     order = [int(x) for x in order]
-    if sorted(order) != list(range(doc.page_count)):
-        raise RuntimeError("Page order must list every page exactly once.")
-    STATE.snapshot("reorder pages")
+    if not order:
+        raise RuntimeError("Keep at least one page.")
+    if len(set(order)) != len(order) or any(x < 0 or x >= doc.page_count for x in order):
+        raise RuntimeError("Page order is invalid.")
+    rotations = [int(r) % 360 for r in (rotations or [])]
+    if rotations and len(rotations) != len(order):
+        raise RuntimeError("Rotations must give one angle per page.")
+    if any(r % 90 for r in rotations):
+        raise RuntimeError("Rotations must be multiples of 90 degrees.")
+    STATE.snapshot("organize pages")
     doc.select(order)
+    for pos, deg in enumerate(rotations):
+        if deg:
+            page = doc[pos]
+            page.set_rotation((page.rotation + deg) % 360)
+
+
+def copy_pages(pages):
+    """Copy the chosen pages into a brand-new PDF and return its bytes.
+    The open working document is not modified."""
+    doc = STATE.require()
+    pages = sorted({int(x) for x in pages})
+    if not pages or pages[0] < 0 or pages[-1] >= doc.page_count:
+        raise RuntimeError("Pick at least one valid page to copy.")
+    out = fitz.open()
+    for p in pages:
+        out.insert_pdf(doc, from_page=p, to_page=p)
+    data = out.tobytes(garbage=3, deflate=True)
+    out.close()
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -539,9 +662,11 @@ class Handler(BaseHTTPRequestHandler):
                     "pages": STATE.doc.page_count,
                     "filename": STATE.filename,
                     "path": STATE.path,
-                    "size_kb": round(len(STATE.to_bytes()) / 1024, 1),
+                    "size_kb": doc_size_kb(),
                     "sizes": page_sizes(),
                     "can_undo": len(STATE.undo) > 0,
+                    "dirty": STATE.dirty,
+                    "rotations": [p.rotation for p in STATE.doc],
                 })
 
             if path == "/api/page":
@@ -564,7 +689,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "spans": page_spans(int(query.get("n", 0)))})
 
             if path in ("/api/export", "/api/save"):
-                return self._download(STATE.to_bytes(), STATE.filename, "application/pdf")
+                name = query.get("name")
+                if name:
+                    name = safe_filename(urllib.parse.unquote_plus(name), STATE.filename)
+                    STATE.filename = name
+                else:
+                    name = STATE.filename
+                data = STATE.to_bytes()
+                STATE.dirty = False        # Saved: the on-disk copy is now current
+                return self._download(data, name, "application/pdf")
+
+            if path == "/api/about":
+                return self._send(200, {
+                    "ok": True,
+                    "version": APP_VERSION,
+                    "engine": "PyMuPDF " + str(getattr(fitz, "VersionBind", "")).strip() or "PyMuPDF",
+                    "python": sys.version.split()[0],
+                    "started": SERVER_STARTED,
+                })
+
+            if path == "/api/copy_pages":
+                sel = [int(x) for x in query.get("pages", "").split(",") if x != ""]
+                data = copy_pages(sel)
+                name = os.path.splitext(STATE.filename)[0] + "_pages.pdf"
+                return self._download(data, safe_filename(name), "application/pdf")
 
             if path == "/api/export_png":
                 n = int(query.get("n", 0))
@@ -574,7 +722,7 @@ class Handler(BaseHTTPRequestHandler):
 
             return self._err("Unknown endpoint: " + path, 404)
         except Exception as e:  # noqa
-            return self._err(e, 500)
+            return self._err(friendly_error(e), 500)
 
     def do_POST(self):
         try:
@@ -588,16 +736,21 @@ class Handler(BaseHTTPRequestHandler):
                 p = self._read_json()
                 with open(p["path"], "rb") as fh:
                     STATE.open_bytes(fh.read(), os.path.basename(p["path"]), path=os.path.abspath(p["path"]))
+                if STATE.locked:   # password-protected: the UI prompts for it
+                    return self._send(200, {"ok": True, "locked": True, "pages": 0, "epoch": STATE.epoch})
                 return self._send(200, {"ok": True, "pages": STATE.doc.page_count, "epoch": STATE.epoch})
 
             if path == "/api/open":
                 p = self._read_json()
                 STATE.open_bytes(base64.b64decode(p["data_b64"]), p.get("filename", "document.pdf"))
+                if STATE.locked:   # password-protected: the UI prompts for it
+                    return self._send(200, {"ok": True, "locked": True, "pages": 0})
                 return self._send(200, {"ok": True, "pages": STATE.doc.page_count})
 
             if path == "/api/edit_text":
                 p = self._read_json()
                 edit_span(int(p["page"]), int(p["span_index"]), p["new_text"])
+                STATE.dirty = True
                 return self._send(200, {"ok": True})
 
             if path == "/api/sign":
@@ -607,11 +760,18 @@ class Handler(BaseHTTPRequestHandler):
                     remove_white=bool(p.get("remove_white", True)),
                     stretch=bool(p.get("stretch", False)),
                 )
+                STATE.dirty = True
                 return self._send(200, {"ok": True})
 
             if path == "/api/undo":
                 label = STATE.pop_undo()
+                STATE.dirty = True
                 return self._send(200, {"ok": True, "undone": label, "pages": STATE.doc.page_count})
+
+            if path == "/api/close":
+                STATE.close()
+                _RENDER_CACHE.clear()
+                return self._send(200, {"ok": True, "epoch": STATE.epoch})
 
             if path == "/api/authenticate":
                 # Provide the password for a PDF that was opened in a locked
@@ -633,6 +793,8 @@ class Handler(BaseHTTPRequestHandler):
                     p.get("filename", "document.pdf"),
                     p.get("password", ""),
                 )
+                # The password-free copy only exists in memory until Saved.
+                STATE.dirty = was_enc
                 return self._send(200, {
                     "ok": True,
                     "pages": STATE.doc.page_count,
@@ -643,6 +805,7 @@ class Handler(BaseHTTPRequestHandler):
                 p = self._read_json()
                 files = [(f["filename"], base64.b64decode(f["data_b64"])) for f in p["files"]]
                 merge_pdfs(files, bool(p.get("include_current", False)))
+                STATE.dirty = True
                 return self._send(200, {"ok": True, "pages": STATE.doc.page_count})
 
             if path == "/api/compress":
@@ -653,6 +816,7 @@ class Handler(BaseHTTPRequestHandler):
                 if level not in COMPRESS_PRESETS:
                     level = "medium"
                 before, after, target_kb = compress(level)
+                STATE.dirty = True
                 pct = round(100 * (1 - after / before)) if before else 0
                 return self._send(200, {
                     "ok": True,
@@ -667,22 +831,26 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/create_from_images":
                 p = self._read_json()
                 imgs = [(f["filename"], base64.b64decode(f["data_b64"])) for f in p["files"]]
-                create_from_images(imgs)
+                create_from_images(imgs, p.get("quality", "normal"))
+                # A brand-new document that exists only in memory until Saved.
+                STATE.dirty = True
                 return self._send(200, {"ok": True, "pages": STATE.doc.page_count})
 
             if path == "/api/delete_pages":
                 p = self._read_json()
                 delete_pages(p["pages"])
+                STATE.dirty = True
                 return self._send(200, {"ok": True, "pages": STATE.doc.page_count})
 
             if path == "/api/reorder":
                 p = self._read_json()
-                reorder_pages(p["order"])
+                reorder_pages(p["order"], p.get("rotations"))
+                STATE.dirty = True
                 return self._send(200, {"ok": True, "pages": STATE.doc.page_count})
 
             return self._err("Unknown endpoint: " + path, 404)
         except Exception as e:  # noqa
-            return self._err(e, 500)
+            return self._err(friendly_error(e), 500)
 
 
 # ---------------------------------------------------------------------------
@@ -693,10 +861,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PyPDF Editor</title>
+<title>PyPDF for Mac</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e9ef; --muted:#8b93a3;
-          --accent:#4f8cff; --accent2:#1f6feb; --ok:#3fb950; --warn:#d29922; }
+          --accent:#4f8cff; --accent2:#1f6feb; --ok:#3fb950; --warn:#d29922;
+          --err:#f85149; --scrolltrack:#0b0d12; --scrollthumb:#3d6fd6; }
+  /* follow the macOS appearance setting */
+  @media (prefers-color-scheme: light){
+    :root { --bg:#f2f3f6; --panel:#ffffff; --line:#d8dce4; --txt:#1d2533; --muted:#5c6575;
+            --accent:#2f6fe4; --accent2:#2f6fe4; --ok:#1a7f37; --warn:#9a6700;
+            --err:#c93c37; --scrolltrack:#e4e7ee; --scrollthumb:#9db7e8; }
+    .stage { box-shadow:0 4px 18px rgba(30,40,60,.18); }
+  }
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
          background:var(--bg); color:var(--txt); height:100vh; display:flex; flex-direction:column; }
@@ -728,11 +904,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .viewer { align-items:safe center; }
   /* distinct scrollbars so they stand out against the dark theme */
   .viewer::-webkit-scrollbar { width:14px; height:14px; }
-  .viewer::-webkit-scrollbar-track { background:#0b0d12; }
-  .viewer::-webkit-scrollbar-thumb { background:#3d6fd6; border-radius:8px;
-            border:3px solid #0b0d12; }
+  .viewer::-webkit-scrollbar-track { background:var(--scrolltrack); }
+  .viewer::-webkit-scrollbar-thumb { background:var(--scrollthumb); border-radius:8px;
+            border:3px solid var(--scrolltrack); }
   .viewer::-webkit-scrollbar-thumb:hover { background:var(--accent); }
-  .viewer::-webkit-scrollbar-corner { background:#0b0d12; }
+  .viewer::-webkit-scrollbar-corner { background:var(--scrolltrack); }
   .stage { position:relative; box-shadow:0 6px 30px rgba(0,0,0,.5); background:#fff; }
   .stage .plabel { position:absolute; top:-17px; left:0; font-size:11px; color:var(--muted); }
   .stage img { display:block; }
@@ -753,7 +929,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .pill { font-size:11px; color:var(--muted); }
   .status { font-size:12px; padding:8px 16px; border-top:1px solid var(--line); background:var(--panel);
             color:var(--muted); min-height:18px; }
-  .status.ok { color:var(--ok); } .status.err { color:#f85149; }
+  .status.ok { color:var(--ok); } .status.err { color:var(--err); }
+  /* drop-anything-here cue while dragging files over the window */
+  body.dragging .viewer { outline:2px dashed var(--accent); outline-offset:-10px; }
+  /* busy overlay for long operations (sits above sheets) */
+  .busy { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none;
+          flex-direction:column; align-items:center; justify-content:center; gap:14px; z-index:200; }
+  .busy.show { display:flex; }
+  .busy .spin { width:42px; height:42px; border-radius:50%;
+                border:4px solid rgba(255,255,255,.25); border-top-color:#fff;
+                animation:busyspin .9s linear infinite; }
+  .busy .bmsg { color:#fff; font-size:13px; }
+  @keyframes busyspin { to { transform:rotate(360deg); } }
   .empty { color:var(--muted); text-align:center; margin-top:80px; font-size:14px; line-height:1.6; }
   .pagedots { display:flex; flex-wrap:wrap; gap:6px; }
   .pagedots label { font-size:12px; display:flex; align-items:center; gap:4px; background:var(--bg);
@@ -784,21 +971,41 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .thumb.over { border-color:var(--accent); }
   .thumb img { display:block; }
   .thumb .badge { position:absolute; left:5px; top:5px; background:rgba(0,0,0,.72); color:#fff;
-                  font-size:11px; padding:1px 6px; border-radius:6px; }
+                  font-size:11px; padding:1px 6px; border-radius:6px; z-index:2; }
+  .thumb .rotbtn { position:absolute; right:38px; top:5px; z-index:2; padding:2px 8px;
+                   font-size:13px; background:rgba(0,0,0,.72); border:0; color:#fff;
+                   border-radius:6px; cursor:pointer; }
+  .thumb .rotbtn:hover { background:var(--accent2); }
+  .thumb .delbtn { position:absolute; right:5px; top:5px; z-index:2; padding:2px 8px;
+                   font-size:13px; background:rgba(0,0,0,.72); border:0; color:#fff;
+                   border-radius:6px; cursor:pointer; }
+  .thumb .delbtn:hover { background:#c93c37; }
+  .thumb .delbtn:disabled { opacity:.35; cursor:not-allowed; }
+  .thumb.picked { border-color:var(--ok); }
+  .thumb .pickmark { position:absolute; right:5px; top:5px; z-index:2; background:var(--ok);
+                     color:#fff; border-radius:50%; width:20px; height:20px; display:flex;
+                     align-items:center; justify-content:center; font-size:12px; }
+  .welcome { display:flex; flex-direction:column; align-items:center; gap:14px; }
+  .welcome .big { font-size:15px; padding:14px 28px; border-radius:12px; min-width:260px; }
+  .welcome .note { color:var(--muted); font-size:12px; line-height:1.7; margin-top:6px; }
+  /* pages live in a wrapper so a pinch can scale them all live with one CSS transform */
+  .pwrap { display:flex; flex-direction:column; align-items:safe center; gap:22px; width:100%; }
 </style>
 </head>
 <body>
 <header>
-  <h1>📄 PyPDF Editor</h1>
+  <h1>📄 PyPDF for Mac</h1>
   <span class="meta" id="meta">No document open</span>
+  <button class="ghost" onclick="openAbout()" title="About this app" style="padding:4px 9px">ⓘ</button>
 </header>
 
 <div class="toolbar">
-  <button onclick="fileInput.click()" title="Open a PDF">Open</button>
-  <button class="ghost" onclick="mergeInput.click()">Merge PDFs</button>
-  <button class="ghost" onclick="imgInput.click()">Create from Images</button>
-  <button class="ghost" onclick="unlockInput.click()" title="Remove the password from a protected PDF">🔓 Unlock PDF</button>
+  <button onclick="guardThen(()=>fileInput.click())" title="Open a PDF">Open</button>
+  <button class="ghost" onclick="guardThen(()=>mergeInput.click())">Merge PDFs</button>
+  <button class="ghost" onclick="guardThen(()=>imgInput.click())">Create from Images</button>
+  <button class="ghost" onclick="guardThen(()=>unlockInput.click())" title="Remove the password from a protected PDF">🔓 Unlock PDF</button>
   <button class="ghost" id="orgBtn" onclick="openOrganize()" disabled>⊞ Organize Pages</button>
+  <button class="ghost" id="copyBtn" onclick="openCopyPages()" title="Copy chosen pages into a brand-new PDF" disabled>⧉ Copy Pages</button>
   <span class="sep"></span>
   <button class="ghost" id="prevBtn" onclick="go(-1)" disabled>◀ Prev</button>
   <span class="pill" id="pageLabel">– / –</span>
@@ -817,24 +1024,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </select>
   <button class="ghost" id="compressBtn" onclick="compress()" disabled>Compress</button>
   <button class="ghost" id="pngBtn" onclick="exportPng()" disabled>Page → PNG</button>
-  <button id="saveBtn" onclick="download('/api/save')" title="Save / download the PDF" disabled>Save</button>
+  <button class="ghost" id="printBtn" onclick="printDoc()" title="Print the document" disabled>🖨 Print</button>
+  <button id="saveBtn" onclick="openSaveModal()" title="Save / download the PDF" disabled>Save</button>
+  <button class="ghost" id="closeBtn" onclick="closeDoc()" title="Close the open document" disabled>✕ Close</button>
 </div>
 
 <div class="main">
   <div class="viewer" id="viewer">
     <div class="empty" id="emptyMsg">
-      Open a PDF to begin, or merge several PDFs into one.<br>
-      Scroll with your mouse to move between pages. Click text to edit it.<br>
-      Upload a signature image, then draw a box on a page to sign.
+      <div class="welcome">
+        <div style="font-size:16px;color:var(--txt);font-weight:600">What would you like to do?</div>
+        <button class="big" onclick="guardThen(()=>fileInput.click())">📄 Open a PDF</button>
+        <button class="big ghost" onclick="guardThen(()=>imgInput.click())">🖼 Create a PDF from images</button>
+        <div class="note">Everything stays on your Mac — nothing is uploaded.<br>
+        Tip: drag a PDF (or images) anywhere into this window.<br>
+        Click text on a page to edit it · pinch or double-click to zoom.</div>
+      </div>
     </div>
+    <div id="pwrap" class="pwrap"></div>
     <!-- page stages injected here -->
   </div>
 
   <div class="side">
     <h2>Signature</h2>
     <button class="ghost" onclick="sigInput.click()">Upload signature image</button>
-    <img id="sigPreview" alt="signature">
-    <label class="check"><input type="checkbox" id="sigKnockout"> Remove white background</label>
+    <img id="sigPreview" alt="signature" draggable="false">
+    <!-- kept for the API but hidden: signatures are placed as-is (off by default) -->
+    <label class="check" style="display:none"><input type="checkbox" id="sigKnockout"> Remove white background</label>
     <div class="hint">Click “Place Signature”, then drag a box on the page. The signature fills the box. Use “Undo” to remove it if it lands in the wrong place.</div>
 
     <h2>Edit text</h2>
@@ -859,6 +1075,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="status" id="status">Ready.</div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
+<div class="busy" id="busy"><div class="spin"></div><div class="bmsg" id="busyMsg">Working…</div></div>
 
 <input type="file" id="fileInput" accept="application/pdf" style="display:none">
 <input type="file" id="mergeInput" accept="application/pdf" multiple style="display:none">
@@ -873,11 +1090,55 @@ let curEpoch = -1;   // last document version this tab has rendered
 let sizes = [], scaleByPage = {};
 let spansByPage = {}, selPage = -1, selIdx = -1;
 let sigB64 = null, signMode = false;
+let rots = [];                                      // per-page rotation (degrees)
 let mergeFiles = [], mergeIncludeCurrent = false;   // merge-order modal
 let orgOrder = [], thumbW = 150;                    // organize-pages modal
 
 const $ = id => document.getElementById(id);
 function setStatus(m, k=""){ const s=$("status"); s.textContent=m; s.className="status "+k; }
+
+// HTML-escape any value interpolated into innerHTML (file names are attacker-
+// controlled: a crafted name could otherwise inject markup into dialogs).
+function esc(s){ return String(s).replace(/[&<>"']/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+// ---------- busy overlay (long operations) ----------
+// Shows after 250ms so quick operations never flicker; blocks stray clicks
+// while the engine is working.
+let _busyT=null;
+function busy(msg){
+  clearTimeout(_busyT);
+  _busyT=setTimeout(()=>{ $("busyMsg").textContent=msg||"Working…"; $("busy").classList.add("show"); },250);
+}
+function unbusy(){ clearTimeout(_busyT); _busyT=null; $("busy").classList.remove("show"); }
+
+// ---------- unsaved-changes protection ----------
+let dirty = false;           // mirrors the server's dirty flag
+let curName = "document.pdf";
+
+// Ask before any action that would REPLACE or CLOSE an unsaved document.
+// Resolves the action immediately when there is nothing to lose.
+function guardThen(action){
+  if(!dirty || pages<=0){ action(); return; }
+  $("modal").innerHTML=`
+    <div class="mhead"><h3>Unsaved changes</h3></div>
+    <div class="mbody">
+      <div style="font-size:13px;line-height:1.6">“${esc(curName)}” has changes that
+      haven’t been saved. If you continue, those changes will be lost.</div>
+    </div>
+    <div class="mfoot">
+      <button class="ghost" onclick="closeModal()">Cancel</button>
+      <button class="ghost" id="guardContinue">Continue without saving</button>
+      <button id="guardSave">Save first</button>
+    </div>`;
+  $("guardContinue").onclick=()=>{ closeModal(); action(); };
+  $("guardSave").onclick=()=>{ openSaveModal(action); };
+  $("overlay").classList.add("show");
+}
+
+window.addEventListener("beforeunload", e=>{
+  if(dirty && pages>0){ e.preventDefault(); e.returnValue=""; }
+});
 
 let _localOps=0, _lastLocalOp=0;   // track in-flight local mutations (POSTs)
 async function api(path, opts){
@@ -900,34 +1161,119 @@ function targetWidth(){
   const avail = $("viewer").clientWidth - 48;
   return Math.round(Math.max(320, Math.min(1100, avail)) * zoomMult);
 }
+// Retina-sharp rendering: request the image at device-pixel resolution (the
+// browser otherwise upscales a CSS-pixel render 2× on HiDPI screens, which is
+// what makes text look soft). Capped so extreme zoom doesn't explode memory.
+function renderWidth(cssW){
+  const dpr=Math.min(window.devicePixelRatio||1, 2);
+  return Math.min(Math.round(cssW*dpr), 3200);
+}
 
 // ---------- open / merge / create / signature upload ----------
-$("fileInput").onchange = async e => {
-  const f=e.target.files[0]; if(!f) return; setStatus("Opening "+f.name+" ...");
+async function openPdfFile(f){
+  setStatus("Opening "+f.name+" ..."); busy("Opening "+f.name+" …");
   try{ const j=await api("/api/open",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({filename:f.name,data_b64:await fileToB64(f)})});
+    if(j.locked){ unbusy(); await promptUnlock(f.name); return; }
     pages=j.pages; cur=0; await rebuild(); setStatus("Opened "+f.name+" ("+pages+" pages).","ok");
-  }catch(err){ setStatus(err.message,"err"); } e.target.value="";
-};
-
-$("mergeInput").onchange = async e => {
-  const files=[...e.target.files]; e.target.value=""; if(!files.length) return;
+  }catch(err){ setStatus(err.message,"err"); }
+  finally{ unbusy(); }
+}
+async function startMerge(files){
   setStatus("Reading "+files.length+" file(s) ...");
   mergeFiles=[];
   for(const f of files) mergeFiles.push({name:f.name, b64:await fileToB64(f)});
   mergeIncludeCurrent=false;
   openMergeModal();
   setStatus("Set the merge order, then click Merge.","");
-};
-
-$("imgInput").onchange = async e => {
-  const files=[...e.target.files]; if(!files.length) return; setStatus("Building PDF from "+files.length+" image(s) ...");
+}
+// Standard / Small-file choice before building a PDF from images (remembered).
+function askImageQuality(){
+  return new Promise(res=>{
+    let q="normal"; try{ q=localStorage.getItem("imgQuality")||"normal"; }catch(e){}
+    $("modal").innerHTML=`
+      <div class="mhead"><h3>Create PDF from images</h3></div>
+      <div class="mbody">
+        <label class="check"><input type="radio" name="iq" value="normal" ${q==="normal"?"checked":""}>
+          Standard — full image quality</label>
+        <label class="check"><input type="radio" name="iq" value="small" ${q==="small"?"checked":""}>
+          Small file — noticeably lighter PDF, great for sharing</label>
+      </div>
+      <div class="mfoot">
+        <button class="ghost" id="iqCancel">Cancel</button>
+        <button id="iqGo">Create PDF</button>
+      </div>`;
+    _modalDismiss=()=>res(null);            // Escape / backdrop = Cancel
+    $("iqCancel").onclick=()=>{ _modalDismiss=null; closeModal(); res(null); };
+    $("iqGo").onclick=()=>{
+      const v=(document.querySelector('input[name="iq"]:checked')||{}).value||"normal";
+      try{ localStorage.setItem("imgQuality",v); }catch(e){}
+      _modalDismiss=null; closeModal(); res(v);
+    };
+    $("overlay").classList.add("show");
+  });
+}
+async function createFromImageFiles(files){
+  const quality=await askImageQuality(); if(!quality) return;
+  setStatus("Building PDF from "+files.length+" image(s) ...");
+  busy("Building PDF from "+files.length+" image(s) …");
   try{ const payload=[]; for(const f of files) payload.push({filename:f.name,data_b64:await fileToB64(f)});
     const j=await api("/api/create_from_images",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({files:payload})});
+        body:JSON.stringify({files:payload, quality})});
     pages=j.pages; cur=0; await rebuild(); setStatus("Created PDF from images ("+pages+" pages).","ok");
-  }catch(err){ setStatus(err.message,"err"); } e.target.value="";
-};
+  }catch(err){ setStatus(err.message,"err"); }
+  finally{ unbusy(); }
+}
+$("fileInput").onchange = e => { const f=e.target.files[0]; e.target.value=""; if(f) openPdfFile(f); };
+$("mergeInput").onchange = e => { const files=[...e.target.files]; e.target.value=""; if(files.length) startMerge(files); };
+$("imgInput").onchange = e => { const files=[...e.target.files]; e.target.value=""; if(files.length) createFromImageFiles(files); };
+
+// ---------- drag & drop anywhere onto the window ----------
+// One PDF opens it; several PDFs open the merge dialog; images become a new
+// PDF. All replacement paths go through the unsaved-changes guard.
+// IMPORTANT: drags that START inside the app (reordering thumbnails in
+// Organize, dragging a page image) must never be treated as a file drop —
+// the browser exposes a dragged <img> as a "file" on drop.
+let _dragDepth=0, _internalDrag=false;
+window.addEventListener("dragstart", ()=>{ _internalDrag=true; });
+window.addEventListener("dragend",   ()=>{ _internalDrag=false; });
+const _externalFileDrag=e=>!_internalDrag && e.dataTransfer
+  && [...(e.dataTransfer.types||[])].includes("Files");
+window.addEventListener("dragenter", e=>{ e.preventDefault();
+  if(!_externalFileDrag(e)) return;
+  _dragDepth++; document.body.classList.add("dragging"); });
+window.addEventListener("dragleave", e=>{ if(--_dragDepth<=0){ _dragDepth=0; document.body.classList.remove("dragging"); } });
+window.addEventListener("dragover", e=>{ e.preventDefault(); });
+window.addEventListener("drop", e=>{
+  e.preventDefault(); _dragDepth=0; document.body.classList.remove("dragging");
+  if(_internalDrag){ _internalDrag=false; return; }            // app-internal drag
+  if($("overlay").classList.contains("show")) return;          // a sheet is open
+  const files=[...((e.dataTransfer&&e.dataTransfer.files)||[])];
+  if(!files.length) return;
+  const pdfs=files.filter(f=>/\.pdf$/i.test(f.name));
+  const imgs=files.filter(f=>/\.(png|jpe?g)$/i.test(f.name));
+  if(pdfs.length===1 && !imgs.length)      guardThen(()=>openPdfFile(pdfs[0]));
+  else if(pdfs.length>1 && !imgs.length)   guardThen(()=>startMerge(pdfs));
+  else if(imgs.length && !pdfs.length)     guardThen(()=>createFromImageFiles(imgs));
+  else setStatus("Drop PDFs or images — not a mix of both.","err");
+});
+
+// ---------- keyboard shortcuts ----------
+// Cmd+S save · Cmd+O open · Cmd+Z undo · arrows / PageUp-Down pages · + / - zoom
+document.addEventListener("keydown", e=>{
+  const mod=e.metaKey||e.ctrlKey;
+  const tag=(e.target&&e.target.tagName)||"";
+  const inField=/^(INPUT|TEXTAREA|SELECT)$/.test(tag);
+  if(mod && (e.key==="s"||e.key==="S")){ e.preventDefault(); if(pages>0) openSaveModal(); return; }
+  if(mod && (e.key==="o"||e.key==="O")){ e.preventDefault(); guardThen(()=>fileInput.click()); return; }
+  if(mod && (e.key==="z"||e.key==="Z") && !inField){ e.preventDefault(); if(pages>0 && !$("undoBtn").disabled) undo(); return; }
+  if(mod || inField || pages<=0) return;
+  if($("overlay").classList.contains("show")) return;   // a dialog has the keys
+  if(e.key==="ArrowRight"||e.key==="PageDown"){ e.preventDefault(); go(1); }
+  else if(e.key==="ArrowLeft"||e.key==="PageUp"){ e.preventDefault(); go(-1); }
+  else if(e.key==="+"||e.key==="="){ e.preventDefault(); zoomBy(0.25); }
+  else if(e.key==="-"){ e.preventDefault(); zoomBy(-0.25); }
+});
 
 $("unlockInput").onchange = async e => {
   const f=e.target.files[0]; e.target.value=""; if(!f) return;
@@ -959,7 +1305,10 @@ async function refreshMeta(){
   const st=await api("/api/state");
   sizes=st.sizes||[];
   if(typeof st.epoch==="number") curEpoch=st.epoch;   // keep tab-sync in step
-  $("meta").textContent=st.filename+"  •  "+st.pages+" pages  •  "+st.size_kb+" KB";
+  dirty=!!st.dirty; curName=st.filename||"document.pdf";
+  rots=st.rotations||[];
+  if(curEpoch!==_thumbEpoch){ clearThumbCache(); _thumbEpoch=curEpoch; }
+  $("meta").textContent=st.filename+"  •  "+st.pages+" pages  •  "+st.size_kb+" KB"+(dirty?"  •  Edited":"");
   $("docInfo").textContent=st.filename+" — "+st.pages+" pages, "+st.size_kb+" KB";
   const dp=$("docPath"); if(dp){ dp.textContent = st.path ? st.path : "(opened from upload — no file path)"; }
   $("undoBtn").disabled=!st.can_undo;
@@ -967,14 +1316,15 @@ async function refreshMeta(){
 
 let pageObserver=null;
 async function rebuild(){
-  const v=$("viewer");
+  const v=$("viewer"), w=$("pwrap");
+  w.style.transform=""; w.style.transformOrigin="";
   v.querySelectorAll(".stage").forEach(s=>s.remove());
   spansByPage={}; scaleByPage={};
   if(pageObserver){ pageObserver.disconnect(); pageObserver=null; }
   if(pages<=0){ $("emptyMsg").style.display="block"; updateButtons(); return; }
   $("emptyMsg").style.display="none";
   await refreshMeta();
-  const tw=targetWidth();
+  const tw=targetWidth(); _lastTW=tw;
   // Lazy render: only fetch a page image when it scrolls near the viewport.
   // This makes the first paint fast even for large documents.
   pageObserver=new IntersectionObserver((entries)=>{
@@ -989,12 +1339,14 @@ async function rebuild(){
     const stage=document.createElement("div");
     stage.className="stage"+(signMode?" signing":""); stage.dataset.page=i;
     const ph = sizes[i] ? Math.round(tw*(sizes[i][1]/sizes[i][0])) : Math.round(tw*1.3);
-    stage.innerHTML=`<span class="plabel">Page ${i+1}</span><img alt="page ${i+1}" style="width:${tw}px;height:${ph}px;background:#fff">`;
+    stage.innerHTML=`<span class="plabel">Page ${i+1}</span><img alt="page ${i+1}" draggable="false" style="width:${tw}px;height:${ph}px;background:#fff">`;
     const img=stage.querySelector("img");
-    img.onload=()=>{ img.style.height="auto"; scaleByPage[i]= sizes[i] ? img.naturalWidth/sizes[i][0] : 1; drawSpans(stage,i); };
-    img.dataset.src="/api/page?n="+i+"&w="+tw+"&t="+Date.now();
+    // spans/signature boxes are positioned in CSS px, so the scale is the
+    // DISPLAYED width per PDF point (the image itself is higher-res)
+    img.onload=()=>{ img.style.height="auto"; scaleByPage[i]= sizes[i] ? tw/sizes[i][0] : 1; drawSpans(stage,i); };
+    img.dataset.src="/api/page?n="+i+"&w="+renderWidth(tw)+"&t="+Date.now();
     attachSign(stage, i);
-    v.appendChild(stage);
+    w.appendChild(stage);
     pageObserver.observe(stage);
   }
   buildDots(); updateButtons(); clearSel();
@@ -1003,8 +1355,10 @@ async function rebuild(){
 async function reloadPage(i){
   const stage=$("viewer").querySelector('.stage[data-page="'+i+'"]'); if(!stage) return;
   const img=stage.querySelector("img");
-  img.onload=()=>{ scaleByPage[i]= sizes[i] ? img.naturalWidth/sizes[i][0] : 1; drawSpans(stage,i); };
-  img.src="/api/page?n="+i+"&w="+targetWidth()+"&t="+Date.now();
+  const tw=targetWidth();
+  img.style.width=tw+"px";
+  img.onload=()=>{ scaleByPage[i]= sizes[i] ? tw/sizes[i][0] : 1; drawSpans(stage,i); };
+  img.src="/api/page?n="+i+"&w="+renderWidth(tw)+"&t="+Date.now();
   await refreshMeta();
 }
 
@@ -1040,7 +1394,12 @@ function clearSel(){ selPage=selIdx=-1; $("editText").value=""; $("editText").di
   $("editHint").textContent="Click a text span on the page.";
   document.querySelectorAll(".span").forEach(s=>s.classList.remove("sel")); }
 async function applyEdit(){
-  if(selIdx<0) return; setStatus("Applying edit ...");
+  if(selIdx<0) return;
+  // Text edits assume an upright page (same limit as the iPhone app) — warn first.
+  if(rots[selPage]){
+    if(!confirm("Page "+(selPage+1)+" is rotated ("+rots[selPage]+"°). Text edits assume an upright page and may land in the wrong place.\n\nApply anyway? (Tip: rotate the page back in Organize Pages first.)")) return;
+  }
+  setStatus("Applying edit ...");
   try{ await api("/api/edit_text",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({page:selPage,span_index:selIdx,new_text:$("editText").value})});
     await reloadPage(selPage); clearSel(); setStatus("Text updated.","ok");
@@ -1105,7 +1464,79 @@ function scrollToPage(i){
   if(stage) stage.scrollIntoView({behavior:"smooth", block:"start"});
 }
 function go(d){ cur=Math.min(pages-1,Math.max(0,cur+d)); scrollToPage(cur); updateButtons(); }
-function zoomBy(d){ if(pages<=0) return; zoomMult=Math.min(3,Math.max(0.5,+(zoomMult+d).toFixed(2))); rebuild(); }
+function zoomBy(d){ if(pages<=0) return; zoomTo(zoomMult+d); }
+
+// Re-render at a new zoom, keeping the point at viewer-height `cy` (px from the
+// top of the viewer; defaults to centre) over the same spot in the document.
+function zoomTo(mult, cy){
+  const v=$("viewer"), w=$("pwrap");
+  mult=Math.min(3,Math.max(0.5,+mult.toFixed(2)));
+  if(mult===zoomMult) return;
+  if(cy===undefined) cy=v.clientHeight/2;
+  const frac=(v.scrollTop+cy)/Math.max(1,w.scrollHeight);
+  zoomMult=mult;
+  rebuild().then(()=>{ v.scrollTop=Math.max(0, frac*w.scrollHeight - cy); });
+}
+
+// ---------- trackpad pinch zoom (live CSS scale, sharp re-render on settle) --
+// macOS trackpad pinches arrive as ctrl+wheel (Chrome/Edge/Firefox) or as
+// gesture* events (Safari). While pinching, one CSS transform scales every
+// page instantly; when fingers settle the document re-renders sharp, anchored
+// at the pinch point.
+let pinch={scale:1, t:null, ox:0, oy:0, cy:0, active:false};
+function pinchStart(cx, cyv){
+  const w=$("pwrap"), v=$("viewer");
+  const r=w.getBoundingClientRect();
+  pinch.ox=cx-r.left; pinch.oy=cyv-r.top;
+  pinch.cy=cyv-v.getBoundingClientRect().top;
+  pinch.active=true;
+}
+function pinchApply(){
+  const w=$("pwrap");
+  w.style.transformOrigin=pinch.ox+"px "+pinch.oy+"px";
+  w.style.transform="scale("+pinch.scale+")";
+  $("zoomLabel").textContent=Math.round(zoomMult*pinch.scale*100)+"%";
+}
+function pinchCommit(){
+  if(!pinch.active) return;
+  const s=pinch.scale;
+  pinch.scale=1; pinch.t=null; pinch.active=false;
+  const w=$("pwrap"); w.style.transform=""; w.style.transformOrigin="";
+  if(Math.abs(s-1)<0.01){ updateButtons(); return; }
+  zoomTo(zoomMult*s, pinch.cy);
+}
+const pinchClamp=s=>Math.min(3/zoomMult, Math.max(0.5/zoomMult, s));
+$("viewer").addEventListener("wheel", e=>{
+  if(!e.ctrlKey || pages<=0) return;          // plain scrolling passes through
+  e.preventDefault();
+  if(!pinch.active) pinchStart(e.clientX, e.clientY);
+  else clearTimeout(pinch.t);
+  pinch.scale=pinchClamp(pinch.scale*Math.exp(-e.deltaY*0.01));
+  pinchApply();
+  pinch.t=setTimeout(pinchCommit, 220);
+},{passive:false});
+// Safari's native pinch events
+let gBase=1;
+$("viewer").addEventListener("gesturestart", e=>{
+  if(pages<=0) return; e.preventDefault();
+  gBase=1; pinchStart(e.clientX, e.clientY);
+},{passive:false});
+$("viewer").addEventListener("gesturechange", e=>{
+  if(pages<=0 || !pinch.active) return; e.preventDefault();
+  pinch.scale=pinchClamp(gBase*e.scale); pinchApply();
+},{passive:false});
+$("viewer").addEventListener("gestureend", e=>{
+  if(pages<=0) return; e.preventDefault(); pinchCommit();
+},{passive:false});
+
+// Double-click toggles 100% <-> 200%, centred on the click (not on text spans,
+// where a double-click means "I'm selecting text to edit").
+$("viewer").addEventListener("dblclick", e=>{
+  if(pages<=0 || signMode) return;
+  if(e.target.closest(".span")) return;
+  const cy=e.clientY-$("viewer").getBoundingClientRect().top;
+  zoomTo(Math.abs(zoomMult-1)<0.05 ? 2.0 : 1.0, cy);
+});
 
 $("viewer").addEventListener("scroll", ()=>{
   if(pages<=0) return;
@@ -1118,8 +1549,13 @@ $("viewer").addEventListener("scroll", ()=>{
   if(best!==cur){ cur=best; updateButtons(); }
 });
 
-let resizeT=null;
-window.addEventListener("resize", ()=>{ if(pages<=0) return; clearTimeout(resizeT); resizeT=setTimeout(rebuild,300); });
+let resizeT=null, _lastTW=0;
+window.addEventListener("resize", ()=>{
+  if(pages<=0) return; clearTimeout(resizeT);
+  // only re-render when the usable width actually changed (height-only
+  // resizes are free — pages are laid out vertically anyway)
+  resizeT=setTimeout(()=>{ if(targetWidth()!==_lastTW) rebuild(); },300);
+});
 
 function updateButtons(){
   const has=pages>0;
@@ -1127,14 +1563,54 @@ function updateButtons(){
   $("zoomLabel").textContent = Math.round(zoomMult*100)+"%";
   $("prevBtn").disabled = !has || cur<=0;
   $("nextBtn").disabled = !has || cur>=pages-1;
-  for(const id of ["compressBtn","compLevel","pngBtn","saveBtn","delBtn","orgBtn"]) $(id).disabled=!has;
+  for(const id of ["compressBtn","compLevel","pngBtn","saveBtn","delBtn","orgBtn","closeBtn","copyBtn","printBtn"]) $(id).disabled=!has;
   $("signBtn").disabled = !has || !sigB64;
 }
 
 // ---------- modal infrastructure ----------
-function closeModal(){ $("overlay").classList.remove("show"); $("modal").innerHTML=""; }
+let _modalDismiss=null;   // lets promise-based dialogs resolve on Escape/backdrop
+function closeModal(){
+  $("overlay").classList.remove("show"); $("modal").innerHTML="";
+  if(modalObserver){ modalObserver.disconnect(); modalObserver=null; }
+  if(_modalDismiss){ const f=_modalDismiss; _modalDismiss=null; f(); }
+}
 $("overlay").addEventListener("mousedown", e=>{ if(e.target.id==="overlay") closeModal(); });
 document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeModal(); });
+
+// ---------- thumbnail cache + lazy loading (Organize / Copy Pages) ----------
+// Thumbnails are fetched once per document version (epoch) and kept as object
+// URLs, so re-rendering the sheet after a drag/rotate/select is instant and a
+// 100-page PDF only loads the thumbnails you actually scroll to.
+const thumbCache=new Map();          // "epoch:page:width" -> object URL
+let modalObserver=null, _thumbEpoch=-1;
+function clearThumbCache(){
+  for(const u of thumbCache.values()) URL.revokeObjectURL(u);
+  thumbCache.clear();
+}
+function loadThumb(img){
+  const key=img.dataset.key;
+  if(thumbCache.has(key)){ img.src=thumbCache.get(key); return; }
+  fetch(img.dataset.url).then(r=>{ if(!r.ok) throw 0; return r.blob(); }).then(b=>{
+    if(!thumbCache.has(key)) thumbCache.set(key, URL.createObjectURL(b));
+    img.src=thumbCache.get(key);
+  }).catch(()=>{});
+}
+function lazyThumbs(){
+  if(modalObserver) modalObserver.disconnect();
+  const imgs=[...$("modal").querySelectorAll("img[data-url]")];
+  // first screenful loads immediately (works even if the observer misbehaves
+  // while the sheet is animating in); the rest load lazily as you scroll
+  imgs.slice(0,12).forEach(loadThumb);
+  if(!window.IntersectionObserver){ imgs.forEach(loadThumb); return; }
+  const root=$("modal").querySelector(".mbody");
+  modalObserver=new IntersectionObserver(es=>{
+    for(const en of es){
+      if(!en.isIntersecting) continue;
+      loadThumb(en.target); modalObserver.unobserve(en.target);
+    }
+  },{root, rootMargin:"600px 0px"});
+  imgs.slice(12).forEach(i=>modalObserver.observe(i));
+}
 
 // generic drag-to-reorder over an array; rerender() rebuilds the list DOM
 function enableDragReorder(containerId, arr, rerender){
@@ -1160,7 +1636,7 @@ function renderMergeModal(){
   const items = mergeFiles.map((f,i)=>`
     <li draggable="true" data-pos="${i}">
       <span class="num">${i+1}</span>
-      <span class="nm" title="${f.name}">${f.name}</span>
+      <span class="nm" title="${esc(f.name)}">${esc(f.name)}</span>
       <button class="ghost" onclick="mMove(${i},-1)">↑</button>
       <button class="ghost" onclick="mMove(${i},1)">↓</button>
       <button class="ghost" onclick="mDel(${i})">✕</button>
@@ -1184,30 +1660,48 @@ function mDel(i){ mergeFiles.splice(i,1); if(!mergeFiles.length){ closeModal(); 
 async function doMerge(){
   if(!mergeFiles.length) return;
   setStatus("Merging "+mergeFiles.length+" file(s) ...");
+  busy("Merging "+mergeFiles.length+" file(s) …");
   try{
     const payload=mergeFiles.map(f=>({filename:f.name,data_b64:f.b64}));
     const j=await api("/api/merge",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({files:payload, include_current:mergeIncludeCurrent})});
     pages=j.pages; cur=0; closeModal(); await rebuild();
-    setStatus("Merged into one PDF ("+pages+" pages).","ok");
+    setStatus("Merged into one PDF ("+pages+" pages). Undo brings the previous document back.","ok");
   }catch(err){ setStatus(err.message,"err"); }
+  finally{ unbusy(); }
 }
 
 // ---------- organize pages modal (thumbnails, drag-reorder, zoom) ----------
+let orgRot={};   // pending rotation per ORIGINAL page index (0/90/180/270)
 function openOrganize(){
   if(pages<=0) return;
-  orgOrder=[...Array(pages).keys()];
-  renderOrganize(); $("overlay").classList.add("show");
+  orgOrder=[...Array(pages).keys()]; orgRot={};
+  $("overlay").classList.add("show"); renderOrganize();
 }
 function renderOrganize(){
-  const thumbs = orgOrder.map((pageIdx,pos)=>`
-    <div class="thumb" draggable="true" data-pos="${pos}" style="width:${thumbW}px">
-      <span class="badge">${pos+1}${pageIdx!==pos?` ← p${pageIdx+1}`:""}</span>
-      <img src="/api/page?n=${pageIdx}&w=${thumbW}&t=org" width="${thumbW}" alt="page ${pageIdx+1}">
-    </div>`).join("");
+  const thumbs = orgOrder.map((pageIdx,pos)=>{
+    const deg=orgRot[pageIdx]||0;
+    const [pw,ph]=sizes[pageIdx]||[595,842];
+    // container keeps width=thumbW; height follows the page's aspect, swapped
+    // when the pending rotation turns the page on its side
+    const boxH=Math.round(thumbW*((deg%180===0)?(ph/pw):(pw/ph)));
+    const imgW=(deg%180===0)?thumbW:boxH;
+    return `
+    <div class="thumb" draggable="true" data-pos="${pos}" style="width:${thumbW}px;height:${boxH}px">
+      <span class="badge">${pos+1}${pageIdx!==pos?` ← p${pageIdx+1}`:""}${deg?` ⟳${deg}°`:""}</span>
+      <button class="rotbtn" draggable="false" title="Rotate this page 90°"
+        onclick="event.stopPropagation();orgRotate(${pageIdx})">⟳</button>
+      <button class="delbtn" draggable="false" title="Remove this page"
+        ${orgOrder.length<=1?"disabled":""}
+        onclick="event.stopPropagation();orgDel(${pos})">✕</button>
+      <img data-url="/api/page?n=${pageIdx}&w=${renderWidth(thumbW)}" data-key="${curEpoch}:${pageIdx}:${renderWidth(thumbW)}"
+        alt="page ${pageIdx+1}" draggable="false"
+        style="position:absolute;left:50%;top:50%;width:${imgW}px;background:#fff;
+               transform:translate(-50%,-50%) rotate(${deg}deg)">
+    </div>`;}).join("");
   $("modal").innerHTML=`
     <div class="mhead">
-      <h3>Organize Pages — drag thumbnails to reorder</h3>
+      <h3>Organize Pages — drag to reorder · ⟳ rotate · ✕ remove</h3>
       <span style="margin-left:auto"></span>
       <button class="ghost" onclick="thumbZoom(-30)">– thumb</button>
       <button class="ghost" onclick="thumbZoom(30)">+ thumb</button>
@@ -1215,18 +1709,67 @@ function renderOrganize(){
     <div class="mbody"><div class="thumbs" id="thumbs">${thumbs}</div></div>
     <div class="mfoot">
       <button class="ghost" onclick="closeModal()">Cancel</button>
-      <button onclick="applyOrder()">Apply order</button>
+      <button onclick="applyOrder()">Apply changes</button>
     </div>`;
   enableDragReorder("thumbs", orgOrder, renderOrganize);
+  lazyThumbs();
 }
+function orgRotate(pageIdx){ orgRot[pageIdx]=((orgRot[pageIdx]||0)+90)%360; renderOrganize(); }
+function orgDel(pos){ if(orgOrder.length<=1) return; orgOrder.splice(pos,1); renderOrganize(); }
 function thumbZoom(d){ thumbW=Math.min(380,Math.max(90,thumbW+d)); renderOrganize(); }
 async function applyOrder(){
-  setStatus("Reordering pages ...");
-  try{ const j=await api("/api/reorder",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({order:orgOrder})});
+  setStatus("Updating pages ...");
+  busy("Updating pages …");
+  try{ const rotations=orgOrder.map(p=>orgRot[p]||0);
+    const j=await api("/api/reorder",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({order:orgOrder, rotations})});
     pages=j.pages; cur=0; closeModal(); await rebuild();
-    setStatus("Pages reordered.","ok");
+    setStatus("Pages updated.","ok");
   }catch(err){ setStatus(err.message,"err"); }
+  finally{ unbusy(); }
+}
+
+// ---------- copy pages -> brand-new PDF (open document untouched) ----------
+let copySel=new Set();
+function openCopyPages(){
+  if(pages<=0) return;
+  copySel=new Set();
+  $("overlay").classList.add("show"); renderCopyModal();
+}
+function renderCopyModal(){
+  const thumbs=[...Array(pages).keys()].map(i=>{
+    const [pw,ph]=sizes[i]||[595,842];
+    const h=Math.round(120*ph/pw);
+    return `
+    <div class="thumb ${copySel.has(i)?"picked":""}" onclick="copyToggle(${i})"
+         style="width:120px;height:${h}px;cursor:pointer">
+      <span class="badge">${i+1}</span>
+      ${copySel.has(i)?'<span class="pickmark">✓</span>':""}
+      <img data-url="/api/page?n=${i}&w=${renderWidth(120)}" data-key="${curEpoch}:${i}:${renderWidth(120)}"
+        width="120" alt="page ${i+1}" draggable="false" style="background:#fff">
+    </div>`;}).join("");
+  $("modal").innerHTML=`
+    <div class="mhead"><h3>Copy pages → new PDF</h3>
+      <span class="pill" style="margin-left:auto">${copySel.size} selected</span></div>
+    <div class="mbody">
+      <div class="hint" style="margin-bottom:10px">Click pages to select them. They are
+        copied into a brand-new PDF — the open document is untouched.</div>
+      <div class="thumbs">${thumbs}</div>
+    </div>
+    <div class="mfoot">
+      <button class="ghost" onclick="closeModal()">Cancel</button>
+      <button ${copySel.size?"":"disabled"} onclick="doCopyPages()">Copy ${copySel.size||"0"} page(s)</button>
+    </div>`;
+  lazyThumbs();
+}
+function copyToggle(i){ copySel.has(i)?copySel.delete(i):copySel.add(i); renderCopyModal(); }
+function doCopyPages(){
+  if(!copySel.size) return;
+  const list=[...copySel].sort((a,b)=>a-b).join(",");
+  const n=copySel.size;
+  closeModal();
+  download("/api/copy_pages?pages="+list);
+  setStatus("Copied "+n+" page(s) into a new PDF — download started.","ok");
 }
 
 // ---------- delete pages ----------
@@ -1252,6 +1795,7 @@ async function compress(){
   const sel=$("compLevel");
   const level = sel ? sel.value : "medium";
   setStatus("Compressing ("+level+") ...");
+  busy("Compressing — this can take a moment on long documents …");
   try{ const j=await api("/api/compress",{method:"POST",
         headers:{"Content-Type":"application/json"}, body:JSON.stringify({level})});
     await rebuild();
@@ -1259,9 +1803,137 @@ async function compress(){
       `  — couldn't get under ${j.target_kb} KB without dropping below readable quality; this is the smallest at this level`;
     setStatus(`Compressed (${j.level}, target <${j.target_kb} KB): ${j.before_kb} KB → ${j.after_kb} KB  (${j.saved_pct}% smaller).`+note,"ok");
   }catch(err){ setStatus(err.message,"err"); }
+  finally{ unbusy(); }
 }
 function download(path){ const a=$("dl"); a.href=path; a.download=""; a.click(); setStatus("Download started.","ok"); }
 function exportPng(){ download("/api/export_png?n="+cur+"&zoom=2.0"); }
+
+// ---------- print ----------
+// Renders every page at high resolution into a new window and opens the
+// system print dialog once they have all loaded.
+function printDoc(){
+  if(pages<=0) return;
+  const pw=window.open("","_blank");
+  if(!pw){ setStatus("Pop-up blocked — allow pop-ups for this app to print.","err"); return; }
+  const d=pw.document;
+  d.write('<!DOCTYPE html><html><head><title>'+esc(curName)+'</title><style>'+
+    'body{margin:0} img{display:block;width:100%;page-break-after:always;break-after:page}'+
+    '</style></head><body></body></html>');
+  d.close();
+  let loaded=0;
+  setStatus("Preparing pages for printing …","");
+  for(let i=0;i<pages;i++){
+    const img=d.createElement("img");
+    img.onload=img.onerror=()=>{
+      if(++loaded===pages){ setStatus("Opening the print dialog …","ok");
+        setTimeout(()=>{ try{ pw.focus(); pw.print(); }catch(e){} },150); }
+    };
+    img.src=location.origin+"/api/page?n="+i+"&zoom=2.0&t="+Date.now();
+    d.body.appendChild(img);
+  }
+}
+
+// ---------- Save dialog (rename + download) ----------
+// afterSave: optional action to run once the save has started (used by the
+// unsaved-changes guard's "Save first" button to resume the original action).
+function openSaveModal(afterSave){
+  if(pages<=0) return;
+  $("modal").innerHTML=`
+    <div class="mhead"><h3>Save PDF</h3></div>
+    <div class="mbody">
+      <div class="hint" style="margin-bottom:8px">File name</div>
+      <input id="saveName" type="text" value="${esc(curName)}" spellcheck="false"
+        style="width:100%;background:var(--bg);color:var(--txt);border:1px solid var(--line);
+               border-radius:7px;padding:9px 10px;font-size:13px">
+      <div class="hint" style="margin-top:10px">The PDF is downloaded to your Downloads
+        folder under this name. The original file on disk is not modified.</div>
+    </div>
+    <div class="mfoot">
+      <button class="ghost" onclick="closeModal()">Cancel</button>
+      <button id="saveGo">Save</button>
+    </div>`;
+  const go=()=>{
+    let name=($("saveName").value||"").trim() || curName;
+    if(!name.toLowerCase().endsWith(".pdf")) name+=".pdf";
+    closeModal();
+    download("/api/save?name="+encodeURIComponent(name));
+    curName=name; dirty=false;
+    setStatus("Saved “"+name+"” to Downloads.","ok");
+    setTimeout(refreshMeta, 600);                 // pick up server-side state
+    if(typeof afterSave==="function") setTimeout(afterSave, 250);
+  };
+  $("saveGo").onclick=go;
+  $("overlay").classList.add("show");
+  const inp=$("saveName");
+  inp.focus(); inp.setSelectionRange(0, Math.max(0,(inp.value.lastIndexOf(".pdf")+4)-4));
+  inp.addEventListener("keydown", e=>{ if(e.key==="Enter") go(); });
+}
+
+// ---------- About dialog + recent-errors log ----------
+// Unexpected errors no longer die silently: they show in the status bar and
+// the last 3 are kept for this session, visible under ⓘ About.
+const recentErrors=[];
+function noteError(msg){
+  msg=String(msg||"unknown error");
+  recentErrors.unshift(new Date().toLocaleTimeString()+" — "+msg);
+  if(recentErrors.length>3) recentErrors.pop();
+  setStatus("Unexpected error: "+msg,"err");
+}
+window.addEventListener("error", e=>{
+  const where=e.filename?` (${(e.filename||"").split("/").pop()}:${e.lineno||"?"})`:"";
+  noteError((e.message||"Script error")+where);
+});
+window.addEventListener("unhandledrejection", e=>{
+  noteError((e.reason&&e.reason.message)||String(e.reason||"unhandled rejection"));
+});
+
+async function openAbout(){
+  let info={};
+  try{ info=await api("/api/about"); }catch(e){}
+  const errs=recentErrors.length
+    ? recentErrors.map(x=>`<div class="hint">${esc(x)}</div>`).join("")
+    : '<div class="hint">None this session.</div>';
+  $("modal").innerHTML=`
+    <div class="mhead"><h3>About PyPDF for Mac</h3></div>
+    <div class="mbody" style="font-size:13px;line-height:1.8">
+      <div><b>Version:</b> ${esc(info.version||"?")}</div>
+      <div><b>Engine:</b> ${esc(info.engine||"PyMuPDF")} · Python ${esc(info.python||"?")}</div>
+      <div><b>Session started:</b> ${esc(info.started||"?")}</div>
+      <div class="hint" style="margin-top:10px">Your PDFs are processed entirely on this Mac
+        by a local helper — nothing is uploaded anywhere.</div>
+      <h2 style="font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:16px 0 6px">Recent errors</h2>
+      ${errs}
+    </div>
+    <div class="mfoot"><button onclick="closeModal()">Close</button></div>`;
+  $("overlay").classList.add("show");
+}
+
+// ---------- Close PDF ----------
+function closeDoc(){
+  if(pages<=0) return;
+  guardThen(async ()=>{
+    try{
+      const j=await api("/api/close",{method:"POST"});
+      if(typeof j.epoch==="number") curEpoch=j.epoch;
+      resetToEmpty();
+      setStatus("Document closed.","ok");
+    }catch(err){ setStatus(err.message,"err"); }
+  });
+}
+function resetToEmpty(){
+  pages=0; cur=0; zoomMult=1.0; dirty=false; curName="document.pdf";
+  sizes=[]; rots=[]; spansByPage={}; scaleByPage={};
+  clearThumbCache();
+  setSign(false); clearSel();
+  const v=$("viewer"); v.querySelectorAll(".stage").forEach(s=>s.remove());
+  if(pageObserver){ pageObserver.disconnect(); pageObserver=null; }
+  $("emptyMsg").style.display="block";
+  $("meta").textContent="No document open";
+  $("docInfo").textContent="—"; $("docPath").textContent="";
+  $("pageDots").innerHTML='<span class="pill">No document.</span>';
+  $("undoBtn").disabled=true;
+  updateButtons();
+}
 
 updateButtons();
 
@@ -1329,6 +2001,10 @@ async function pollForNewDoc(){
         pages=st.pages; cur=0; await rebuild();
         setStatus("Opened "+st.filename+" ("+pages+" pages).","ok");
         try{ window.focus(); }catch(e){}
+      } else if(pages>0){
+        // The document was closed from another tab — clear this one too.
+        resetToEmpty();
+        setStatus("Document closed.","");
       }
     }
   }catch(e){ /* server not reachable */ }
@@ -1452,7 +2128,7 @@ def main():
     url = f"http://{HOST}:{port}"
     server = ThreadingHTTPServer((HOST, port), Handler)
     print("=" * 56)
-    print("  PyPDF Editor is running")
+    print("  PyPDF for Mac is running")
     print(f"  PyMuPDF {getattr(fitz, 'VersionBind', '?')}")
     print(f"  Open in your browser:  {url}")
     print("  Press Ctrl+C here to stop.")

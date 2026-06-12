@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# build_app.command  -  Build & install "PyPDF Editor.app" on macOS
+# build_app.command  -  Build & install "PyPDF for Mac.app" on macOS
 # ---------------------------------------------------------------------------
 # Double-click this file (or run it in Terminal). It will:
 #   1. Find a python3 that has PyMuPDF (or fall back to the system python3).
@@ -15,7 +15,7 @@
 
 set -e
 
-APP_NAME="PyPDF Editor"
+APP_NAME="PyPDF for Mac"
 BUNDLE_ID="com.pyedit.pdfeditor"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY_SRC="$SCRIPT_DIR/pdf_editor_app.py"
@@ -60,7 +60,7 @@ fi
 echo "-> Compiling app launcher ..."
 LAUNCHER="$TMP_DIR/launcher.applescript"
 cat > "$LAUNCHER" <<APPLESCRIPT
--- PyPDF Editor launcher
+-- PyPDF for Mac launcher
 property pythonPath : "$PYTHON"
 
 on run
@@ -75,21 +75,53 @@ end open
 
 on launchEditor(filePath)
     set pyScript to POSIX path of (path to resource "pdf_editor_app.py")
+    -- prefer the app's own embedded Python environment (self-contained);
+    -- fall back to the system interpreter chosen at install time
+    set appPython to pythonPath
+    try
+        set venvDir to POSIX path of (path to resource "venv")
+        set appPython to venvDir & "bin/python3"
+    end try
     if filePath is "" then
-        do shell script quoted form of pythonPath & " " & quoted form of pyScript & " > /dev/null 2>&1 &"
+        do shell script quoted form of appPython & " " & quoted form of pyScript & " > /dev/null 2>&1 &"
     else
-        do shell script quoted form of pythonPath & " " & quoted form of pyScript & " " & quoted form of filePath & " > /dev/null 2>&1 &"
+        do shell script quoted form of appPython & " " & quoted form of pyScript & " " & quoted form of filePath & " > /dev/null 2>&1 &"
     end if
 end launchEditor
 APPLESCRIPT
 
 rm -rf "$DEST"
+# the app was previously installed as "PyPDF Editor.app" — remove it so two
+# copies don't linger in Applications after the rename
+rm -rf "/Applications/PyPDF Editor.app"
+
+# Stop any editor server still running from an older build. A leftover old
+# server would otherwise keep serving the OLD interface to new launches.
+echo "-> Stopping any running editor from a previous build ..."
+pkill -f "pdf_editor_app.py" 2>/dev/null || true
+
 osacompile -o "$DEST" "$LAUNCHER"
 
 # --- 3. embed editor + icon ------------------------------------------------
 echo "-> Embedding editor and icon ..."
 RES="$DEST/Contents/Resources"
 cp "$PY_SRC" "$RES/pdf_editor_app.py"
+
+# --- 3b. embed a private Python environment (self-contained app) -----------
+# The app then keeps working even if Homebrew/system Python packages change.
+# Needs internet once (~40MB). On failure the launcher falls back to $PYTHON.
+echo "-> Building the app's private Python environment (one time, ~40MB) ..."
+VENV="$RES/venv"
+if "$PYTHON" -m venv --copies "$VENV" >/dev/null 2>&1 \
+   && "$VENV/bin/python3" -m pip install --quiet --upgrade pip >/dev/null 2>&1 \
+   && "$VENV/bin/python3" -m pip install --quiet pymupdf >/dev/null 2>&1 \
+   && "$VENV/bin/python3" -c "import fitz" >/dev/null 2>&1; then
+    echo "   Private environment ready — the app is now self-contained."
+else
+    echo "   Could not build the private environment (offline?)."
+    echo "   The app will use $PYTHON instead — everything still works."
+    rm -rf "$VENV"
+fi
 
 if [ -f "$ICON_PNG" ]; then
     ICONSET="$TMP_DIR/AppIcon.iconset"
@@ -98,7 +130,16 @@ if [ -f "$ICON_PNG" ]; then
         sips -z $sz $sz       "$ICON_PNG" --out "$ICONSET/icon_${sz}x${sz}.png"       >/dev/null 2>&1
         sips -z $((sz*2)) $((sz*2)) "$ICON_PNG" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1
     done
-    iconutil -c icns "$ICONSET" -o "$RES/applet.icns" 2>/dev/null || true
+    if iconutil -c icns "$ICONSET" -o "$TMP_DIR/AppIcon.icns" 2>/dev/null; then
+        # replace BOTH possible icon files so no build of osacompile keeps its
+        # default (the generic "applet" / Python-looking icon)
+        cp "$TMP_DIR/AppIcon.icns" "$RES/applet.icns"
+        cp "$TMP_DIR/AppIcon.icns" "$RES/AppIcon.icns"
+        echo "   Icon built OK."
+    else
+        echo "   WARNING: could not build the icon (iconutil failed) — the app"
+        echo "   will keep the generic icon. Check that appicon.png is a valid PNG."
+    fi
 fi
 
 # --- 4. patch Info.plist (identity + PDF document type) --------------------
@@ -109,6 +150,16 @@ PB=/usr/libexec/PlistBuddy
 $PB -c "Set :CFBundleIdentifier $BUNDLE_ID"        "$PLIST" 2>/dev/null || $PB -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$PLIST"
 $PB -c "Set :CFBundleName '$APP_NAME'"             "$PLIST" 2>/dev/null || $PB -c "Add :CFBundleName string '$APP_NAME'" "$PLIST"
 $PB -c "Set :LSMinimumSystemVersion 10.13"         "$PLIST" 2>/dev/null || $PB -c "Add :LSMinimumSystemVersion string 10.13" "$PLIST"
+
+# Version is read from APP_VERSION in pdf_editor_app.py so the bundle always
+# matches the editor build inside it.
+APP_VER="$(grep -m1 '^APP_VERSION' "$PY_SRC" | sed 's/.*"\([^"]*\)".*/\1/')"
+[ -z "$APP_VER" ] && APP_VER="1.0"
+$PB -c "Set :CFBundleShortVersionString $APP_VER"  "$PLIST" 2>/dev/null || $PB -c "Add :CFBundleShortVersionString string $APP_VER" "$PLIST"
+$PB -c "Set :CFBundleVersion $APP_VER"             "$PLIST" 2>/dev/null || $PB -c "Add :CFBundleVersion string $APP_VER" "$PLIST"
+# point the bundle at our icon explicitly (and bump the bundle's mtime later
+# so Finder notices the change)
+$PB -c "Set :CFBundleIconFile AppIcon"             "$PLIST" 2>/dev/null || $PB -c "Add :CFBundleIconFile string AppIcon" "$PLIST"
 
 # Declare that this app opens PDF files (shows in Open With; eligible as default)
 $PB -c "Delete :CFBundleDocumentTypes" "$PLIST" 2>/dev/null || true
@@ -153,8 +204,10 @@ with open(plist_path, "wb") as f:
 print("   Default handler updated.")
 PYDEF
 
+touch "$DEST"
 "$LSREGISTER" -kill -r -domain local -domain system -domain user 2>/dev/null || true
 /usr/bin/killall Finder 2>/dev/null || true
+/usr/bin/killall Dock 2>/dev/null || true
 
 echo ""
 echo "=================================================="
