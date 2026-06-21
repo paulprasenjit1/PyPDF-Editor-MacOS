@@ -123,6 +123,17 @@ else
     rm -rf "$VENV"
 fi
 
+# --- 3c. optional extras (non-fatal) ---------------------------------------
+# numpy speeds up signature white-removal. Not required — the app degrades
+# gracefully without it.
+if [ -x "$VENV/bin/python3" ]; then
+    if "$VENV/bin/python3" -m pip install --quiet numpy >/dev/null 2>&1; then
+        echo "   numpy installed (faster signature processing)."
+    else
+        echo "   numpy skipped (optional — signatures still work)."
+    fi
+fi
+
 if [ -f "$ICON_PNG" ]; then
     ICONSET="$TMP_DIR/AppIcon.iconset"
     mkdir -p "$ICONSET"
