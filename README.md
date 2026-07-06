@@ -1,68 +1,71 @@
-# PyPDF Editor — macOS App
+# PyPDF for Mac — native build
 
-Turns your `pdf_editor_final.py` editor into a real macOS app that lives in
-**Applications**, opens PDFs on **double-click**, and shows up under
-**right-click → Open With**.
+A standalone macOS PDF editor. It runs in its own native window (via pywebview /
+WKWebView) — no browser, no visible `localhost` URL — and opens multiple PDFs as
+Acrobat-style tabs. All PDF work happens locally with PyMuPDF; nothing is
+uploaded.
+
+This is the native, self-contained successor to the original browser-based build.
+
+## What changed from the browser version
+
+- **Native window** instead of a Safari/Chrome tab. The UI is identical; only the
+  wrapper changed. `webbrowser.open()` was replaced with a pywebview window, with
+  an automatic fallback to the default browser if pywebview is missing.
+- **Multiple documents in tabs.** Each open PDF is its own in-memory document,
+  addressed by a tab id sent on every request. Opening a PDF (toolbar **Open**,
+  drag-and-drop, **Create from images**, **Unlock**, double-click in Finder)
+  creates a new tab with its own close (✕) button. Editing one tab never touches
+  another.
+- **Self-contained packaging.** `PyInstaller` bundles Python, PyMuPDF and
+  pywebview inside the `.app`, so the end user needs nothing installed.
+
+## Run from source (quickest way to try it)
+
+```bash
+cd pypdf-native
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python3 pdf_editor_app.py            # opens the native window
+python3 pdf_editor_app.py file.pdf   # open a PDF straight into the first tab
+```
+
+If pywebview is not installed it still runs, falling back to your default browser.
+
+## Build the installable .app
+
+```bash
+./build_native.command
+```
+
+This builds `dist/PyPDF for Mac.app` with PyInstaller (see `PyPDF.spec`),
+**ad-hoc signs** it (`codesign -s -`) so it
+runs on the Mac that built it without an Apple Developer account, removes the
+quarantine flag, registers it as a PDF handler, and installs it to
+`/Applications`. It will offer to set the app as the default for all PDFs.
+
+> Ad-hoc signing is for personal use on your own Mac. The app is **not** notarized,
+> so distributing it to other Macs would trigger Gatekeeper warnings. For wider
+> distribution you would need a Developer ID signature and Apple notarization.
+
+## Licensing (important for the public GitHub repo)
+
+This app uses **PyMuPDF**, which is licensed under **AGPL-3.0** (or a paid
+commercial licence from Artifex). Because of AGPL's copyleft:
+
+- Personal use is unrestricted.
+- Publishing the source publicly on GitHub is fine **as long as this project is
+  also licensed under AGPL-3.0** and the source is available to anyone who uses it.
+- You may **not** ship it as a closed-source or paid product without buying a
+  commercial PyMuPDF licence.
+
+A `LICENSE` (AGPL-3.0) and `NOTICE` file are included. Keep them in the repo.
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `pdf_editor_app.py` | The editor (same as `pdf_editor_final.py`) plus the ability to auto-open a PDF passed when launched. Do not rename. |
-| `appicon.png` | App icon source (converted to `.icns` during build). |
-| `build_app.command` | One-click installer. Run it once on your Mac. |
-
-Keep these three files together in the same folder.
-
-## Install (one time)
-
-1. Double-click **`build_app.command`**.
-   - If macOS blocks it: right-click → **Open** → **Open**, or run in Terminal:
-     `bash "build_app.command"`
-2. It builds **PyPDF Editor.app**, drops it in `/Applications`, sets it as the
-   **default app for all PDFs**, and refreshes Finder.
-3. Done. Double-click any PDF — it opens in the editor (in your browser, served
-   locally). Right-click → Open With also lists **PyPDF Editor**.
-
-> If a PDF still opens in Preview right after install, log out and back in once
-> (or restart) so macOS commits the default-handler change.
-
-## How it works
-
-The app is a small AppleScript launcher bundle. On open it receives the PDF
-path from macOS and runs `pdf_editor_app.py <file>`, which loads that PDF and
-opens the editor UI in your browser. Launching the app with no file just opens
-an empty editor.
-
-### Single instance (one tab)
-
-Opening several PDFs no longer spawns a new server and tab each time. A launch
-first checks whether the editor is already running; if so it hands the new PDF
-to that instance, and the existing browser tab switches to it automatically
-(within ~1.5s). Only the first open starts a server / opens a tab.
-
-### Faster opening
-
-- Pages render lazily — only pages near the viewport are fetched on open, so the
-  first page appears almost immediately even for large PDFs.
-- Page images are sent as JPEG (faster to encode and transfer than PNG).
-- A small server-side cache avoids re-rendering pages you scroll back to.
-- The browser launches as soon as the server is ready (no fixed delay).
-
-Document edits (text, signatures, export) are unaffected and stay full quality.
-
-## Requirements
-
-- A `python3` with **PyMuPDF** (`pip install pymupdf`). The build script finds
-  one automatically (Homebrew or system Python). If none has PyMuPDF, the app
-  tries to install it on first run.
-
-## Updating
-
-Edit `pdf_editor_app.py`, then re-run `build_app.command` to rebuild.
-
-## Revert default back to Preview
-
-Right-click any PDF → **Get Info** → **Open with:** → choose **Preview** →
-**Change All…**. To remove the app, drag `/Applications/PyPDF Editor.app` to
-the Trash.
+- `pdf_editor_app.py` — the whole app (server + UI + PDF engine).
+- `PyPDF.spec` — PyInstaller build configuration (used by the build script).
+- `setup.py` — legacy py2app config, kept for reference (not used by the build).
+- `build_native.command` — one-click build + ad-hoc sign + install.
+- `requirements.txt` — runtime dependencies.
+- `appicon.png` — app icon source (converted to `.icns` at build time).

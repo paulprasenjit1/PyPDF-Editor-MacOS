@@ -37,7 +37,6 @@ import secrets
 import shutil
 import tempfile
 import subprocess
-import glob
 
 try:
     import numpy as _np            # optional: only used to speed up white-knockout
@@ -91,12 +90,28 @@ def _ensure_pymupdf():
         pip("-U", "pymupdf")
 
 
-_ensure_pymupdf()
+def _is_frozen():
+    """True when running inside a packaged .app (py2app/PyInstaller). In that
+    case PyMuPDF is already bundled — we must NOT try to pip-install it, because
+    sys.executable is the app itself, not a Python that can run pip. Doing so is
+    what produces py2app's generic 'Launch error'."""
+    return bool(getattr(sys, "frozen", False)) or ".app/Contents/" in sys.executable
+
+
+# Only auto-install/upgrade PyMuPDF when running from source. A frozen bundle
+# ships its own PyMuPDF and just imports it.
+if not _is_frozen():
+    _ensure_pymupdf()
 import fitz  # noqa
 
 PORT = 8080
 HOST = "127.0.0.1"
-APP_VERSION = "4.30"         # Find-in-text highlights ALL matches in yellow (current in orange); selectable text div
+# Single source of truth for the version. BUNDLE_VERSION is the numeric
+# CFBundleVersion the build reads out of this file (PyPDF.spec and setup.py
+# parse it); APP_VERSION derives from it and feeds About + the versioned
+# single-instance token, so app, bundle, and hand-off can never drift again.
+BUNDLE_VERSION = "5.5.0"
+APP_VERSION = BUNDLE_VERSION + "-native"   # v5.5: atomic saves, close guard, tokened GETs, lifecycle fixes
 SERVER_STARTED = time.strftime("%Y-%m-%d %H:%M")
 
 UNDO_LIMIT = 15
@@ -129,6 +144,12 @@ APP_NONCE = secrets.token_urlsafe(24)
 # /api/open_path. Defence-in-depth beyond the Origin check (which the headless
 # launcher passes by sending no Origin).
 HANDOFF_SECRET = secrets.token_urlsafe(18)
+
+# Boot secret: required to load "/" (the page that embeds APP_NONCE). It is
+# carried only in the URL the launcher opens (native window / fallback browser),
+# so another local process can no longer fetch the page and mine the CSRF token
+# out of it. Reloads (⌘R) keep the query string, so they keep working.
+PAGE_BOOT = secrets.token_urlsafe(16)
 
 # Idle auto-shutdown: the browser tab sends a heartbeat every few seconds while
 # it is open. When every tab has been closed for IDLE_SHUTDOWN_SEC, the server
@@ -273,6 +294,32 @@ class State:
 
 STATE = State()
 
+# ---------------------------------------------------------------------------
+# Lightweight progress channel for long operations (compress / merge / images).
+# A blocking POST holds STATE_LOCK for its whole duration, so the page can't ask
+# the document anything mid-operation. Instead, operations publish coarse
+# progress here and the page polls GET /api/progress (which never takes the lock
+# and returns instantly). Plain dict writes are atomic enough under the GIL for
+# a single set of monotonic counters.
+PROGRESS = {"active": False, "label": "", "cur": 0, "total": 0, "msg": "", "id": 0}
+
+def progress_begin(label, total, msg=""):
+    PROGRESS["id"] += 1
+    PROGRESS["active"] = True
+    PROGRESS["label"] = label
+    PROGRESS["cur"] = 0
+    PROGRESS["total"] = max(0, int(total))
+    PROGRESS["msg"] = msg or label
+
+def progress_step(cur, msg=None):
+    PROGRESS["cur"] = int(cur)
+    if msg is not None:
+        PROGRESS["msg"] = msg
+
+def progress_end():
+    PROGRESS["active"] = False
+
+
 # PyMuPDF documents are NOT thread-safe and the server is threaded. Every
 # handler that reads or mutates STATE.doc holds this lock for the duration of
 # its document work, serialising all engine access. For a single user the cost
@@ -280,18 +327,127 @@ STATE = State()
 # (or worse) when an operation runs while pages are still streaming in.
 STATE_LOCK = threading.RLock()
 
+# ---------------------------------------------------------------------------
+# Multi-document registry (Acrobat-style tabs)
+# ---------------------------------------------------------------------------
+# Several PDFs can be open at once, each its own State. The module global STATE
+# is an "active pointer" that every handler and helper already reads; we simply
+# rebind it, under STATE_LOCK, to the tab named by each request's X-PyPDF-Tab
+# header. This keeps the ~100 existing `STATE.` references working unchanged.
+#
+# DOCS preserves tab order (it is an OrderedDict). TABS_REV bumps whenever the
+# set, order, or names of tabs change, so the frontend (and other launches that
+# hand off a file) can detect a new/closed tab by polling /api/ping.
+DOCS = OrderedDict()        # tab_id -> State
+TABS_REV = 0                # bumps on any tab add/remove/rename
+ACTIVE_TAB = None           # the tab STATE currently points at (per last bind)
+_EMPTY_STATE = State()      # bound when no/unknown tab — reports "no document"
+
+# Endpoints that may CREATE the tab named in the header (open-like actions).
+# Everything else must address a tab that already exists.
+_OPEN_ENDPOINTS = {
+    "/api/open", "/api/create_from_images", "/api/unlock", "/api/merge",
+}
+
+
+def _new_tab_id():
+    return "t" + secrets.token_urlsafe(8)
+
+
+def _bump_tabs():
+    global TABS_REV
+    TABS_REV += 1
+
+
+def bind_tab(tab_id, create=False):
+    """Point the module global STATE at the given tab. Must hold STATE_LOCK.
+    With create=True an unknown id is registered as a fresh document; otherwise
+    an unknown id binds the shared empty state (so reads report 'no document')."""
+    global STATE, ACTIVE_TAB
+    if tab_id and tab_id in DOCS:
+        STATE = DOCS[tab_id]
+        ACTIVE_TAB = tab_id
+        return tab_id
+    if create:
+        tid = tab_id or _new_tab_id()
+        DOCS[tid] = State()
+        STATE = DOCS[tid]
+        ACTIVE_TAB = tid
+        _bump_tabs()
+        return tid
+    STATE = _EMPTY_STATE
+    ACTIVE_TAB = None
+    return None
+
+
+def _purge_tab_caches(tab_id):
+    """Drop every cached render/bbox/size entry belonging to a closed tab."""
+    for cache in (_RENDER_CACHE, _BBOX_CACHE):
+        for k in [k for k in cache if isinstance(k, tuple) and k and k[0] == tab_id]:
+            cache.pop(k, None)
+    _SIZE_CACHE.pop(tab_id, None)
+
+
+def close_tab(tab_id):
+    """Remove a tab and free its document + caches. Returns True if it existed."""
+    st = DOCS.pop(tab_id, None)
+    if st is None:
+        return False
+    try:
+        st.close()
+    except Exception:
+        pass
+    _purge_tab_caches(tab_id)
+    _bump_tabs()
+    return True
+
+
+def tabs_summary():
+    """Ordered, JSON-safe description of every open tab for the frontend."""
+    out = []
+    for tid, st in DOCS.items():
+        out.append({
+            "id": tid,
+            "name": st.filename,
+            "path": st.path,
+            "open": st.doc is not None,
+            "locked": st.locked,
+            "dirty": st.dirty,
+            "pages": st.doc.page_count if st.doc is not None else 0,
+        })
+    return out
+
+
+def open_file_as_new_tab(path):
+    """Load a file from disk into a brand-new tab (PDF, or an image -> 1-page
+    PDF). Used by the macOS 'open document' handler when the running app is
+    asked to open a file. Bumps tabs_rev so the window picks the tab up."""
+    with STATE_LOCK:
+        bind_tab(_new_tab_id(), create=True)
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        fname = os.path.basename(path)
+        if image_format(raw):
+            create_from_images([(fname, raw)])
+            STATE.dirty = True
+        else:
+            STATE.open_bytes(raw, fname, path=os.path.abspath(path))
+
 
 # /api/state is called after every operation AND on every zoom/resize rebuild;
 # serialising the whole document each time just to show its size is the single
 # hottest wasted cost on large PDFs. Cache it per document version instead.
-_SIZE_CACHE = {"epoch": -1, "kb": 0.0}
+# Keyed per tab so each open document keeps its own cached size; a tab's entry
+# is dropped when it closes (see _purge_tab_caches).
+_SIZE_CACHE = {}   # tab_id -> {"epoch": int, "kb": float}
 
 
 def doc_size_kb():
-    if _SIZE_CACHE["epoch"] != STATE.epoch:
-        _SIZE_CACHE["kb"] = STATE.display_size_kb()
-        _SIZE_CACHE["epoch"] = STATE.epoch
-    return _SIZE_CACHE["kb"]
+    ent = _SIZE_CACHE.get(ACTIVE_TAB)
+    if ent is None or ent["epoch"] != STATE.epoch:
+        ent = {"epoch": STATE.epoch, "kb": STATE.display_size_kb()}
+        _SIZE_CACHE[ACTIVE_TAB] = ent
+    return ent["kb"]
 
 
 def safe_filename(name, fallback="document.pdf"):
@@ -301,9 +457,40 @@ def safe_filename(name, fallback="document.pdf"):
     name = name.strip().lstrip(".")
     if not name:
         return fallback
-    if not name.lower().endswith(".pdf"):
-        name += ".pdf"
-    return name[:120]
+    # Cap the STEM, then re-attach the extension — truncating after appending
+    # would silently drop ".pdf" from very long names.
+    if name.lower().endswith(".pdf"):
+        name = name[:-4]
+    return name[:116] + ".pdf"
+
+
+def atomic_write(path, data, keep_stat=False):
+    """Write `data` to `path` atomically: render to a temp file in the SAME
+    directory, flush it to disk, then os.replace() over the target. A crash or
+    full disk mid-write leaves any existing file untouched rather than
+    truncated/corrupted. With keep_stat=True the original file's permissions
+    are preserved (used when overwriting a file the user already owns)."""
+    d = os.path.dirname(path) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".pypdf-save-", suffix=".tmp")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if keep_stat and os.path.exists(path):
+            try:
+                shutil.copystat(path, tmp)
+            except Exception:
+                pass
+        os.replace(tmp, path)              # atomic on the same volume
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
 
 def friendly_error(e):
@@ -343,7 +530,26 @@ def int_to_rgb(color):
 # ---------------------------------------------------------------------------
 # Image helper: knock out a (near) white background -> transparent
 # ---------------------------------------------------------------------------
-def knockout_white(img_bytes, thresh=238):
+# Knock out a signature photo's paper background so only the ink shows, the way
+# Adobe Sign does — the result blends onto any PDF page colour instead of sitting
+# in a visible box. This is colour-aware, not a flat white threshold: real
+# signatures are often photographed on off-white, grey, or shadowed paper (corner
+# luminance well below pure white and uneven across the image), where a flat
+# threshold would leave a grey rectangle or shadow. Each pixel is kept by the
+# stronger of two ink cues:
+#   * darkness  - ink strokes are much darker than paper (covers black ink too)
+#   * colour    - ink is saturated (blue/black pen) while paper/shadow is neutral
+# Neutral, light pixels (paper + soft shadows) score low on both -> transparent.
+# Both cues ramp smoothly so stroke edges stay anti-aliased.
+#
+# Tunables match the PWA build so both apps behave identically:
+_SIG_DARK_LO = 110.0   # at/below this luminance -> fully opaque ink
+_SIG_DARK_HI = 175.0   # above this (and neutral) -> background
+_SIG_SAT_LO = 25.0     # below this saturation -> treated as neutral paper
+_SIG_SAT_HI = 60.0     # at/above this -> fully "ink" colour
+
+
+def knockout_white(img_bytes):
     try:
         src = fitz.Pixmap(img_bytes)
         if src.alpha:
@@ -352,21 +558,32 @@ def knockout_white(img_bytes, thresh=238):
             src = fitz.Pixmap(fitz.csRGB, src)      # normalise to RGB
         w, h = src.width, src.height
         if _np is not None:
-            # Vectorised: ~6x faster than the per-pixel loop on a 1.4 MP image.
-            rgb = _np.frombuffer(src.samples, dtype=_np.uint8).reshape(h * w, 3)
-            alpha = _np.where((rgb >= thresh).all(axis=1), 0, 255).astype(_np.uint8)
+            # Vectorised path (~fast on multi-MP images).
+            rgb = _np.frombuffer(src.samples, dtype=_np.uint8).reshape(h * w, 3).astype(_np.float32)
+            r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            sat = rgb.max(axis=1) - rgb.min(axis=1)
+            dark = (_SIG_DARK_HI - lum) / (_SIG_DARK_HI - _SIG_DARK_LO)
+            color = (sat - _SIG_SAT_LO) / (_SIG_SAT_HI - _SIG_SAT_LO)
+            keep = _np.clip(_np.maximum(dark, color), 0.0, 1.0)
+            alpha = _np.rint(keep * 255.0).astype(_np.uint8)
             rgba = _np.empty((h * w, 4), dtype=_np.uint8)
-            rgba[:, :3] = rgb
+            rgba[:, :3] = rgb.astype(_np.uint8)
             rgba[:, 3] = alpha
             return fitz.Pixmap(fitz.csRGB, w, h, rgba.tobytes(), 1).tobytes("png")
         rgb = src.samples
         out = bytearray(w * h * 4)
         for i in range(w * h):
             r, g, b = rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            sat = max(r, g, b) - min(r, g, b)
+            dark = (_SIG_DARK_HI - lum) / (_SIG_DARK_HI - _SIG_DARK_LO)
+            color = (sat - _SIG_SAT_LO) / (_SIG_SAT_HI - _SIG_SAT_LO)
+            keep = max(0.0, min(1.0, max(dark, color)))
             out[i * 4] = r
             out[i * 4 + 1] = g
             out[i * 4 + 2] = b
-            out[i * 4 + 3] = 0 if (r >= thresh and g >= thresh and b >= thresh) else 255
+            out[i * 4 + 3] = int(round(keep * 255.0))
         return fitz.Pixmap(fitz.csRGB, w, h, bytes(out), 1).tobytes("png")
     except Exception:
         return img_bytes  # fall back to original if anything goes wrong
@@ -408,7 +625,7 @@ def content_bbox(page, pad=6.0):
     pages, and no pixmap allocation). The object extent can be a hair larger than
     the visual ink extent, which only ever makes fit-to-page slightly more
     conservative (never clips)."""
-    key = (STATE.epoch, page.number)
+    key = (ACTIVE_TAB, STATE.epoch, page.number)
     hit = _BBOX_CACHE.get(key)
     if hit is not None:
         _BBOX_CACHE.move_to_end(key)
@@ -493,7 +710,7 @@ _RENDER_CACHE_MAX = 64
 
 
 def render_page_cached(page_num, target_w):
-    key = (STATE.epoch, int(page_num), int(target_w))
+    key = (ACTIVE_TAB, STATE.epoch, int(page_num), int(target_w))
     hit = _RENDER_CACHE.get(key)
     if hit is not None:
         _RENDER_CACHE.move_to_end(key)
@@ -899,10 +1116,21 @@ def merge_pdfs(files, include_current=False):
     new = fitz.open()
     if include_current and STATE.doc is not None:
         new.insert_pdf(STATE.doc)
-    for _name, raw in files:
-        src = fitz.open(stream=raw, filetype="pdf")
-        new.insert_pdf(src)
-        src.close()
+    progress_begin("merge", len(files), "Merging\u2026")
+    try:
+        for _i, (_name, raw) in enumerate(files):
+            progress_step(_i, "Merging \u201c%s\u201d\u2026" % (_name or "file"))
+            try:
+                src = fitz.open(stream=raw, filetype="pdf")
+            except Exception:
+                raise RuntimeError(
+                    "Couldn\u2019t read \u201c%s\u201d \u2014 it appears damaged "
+                    "or isn\u2019t a valid PDF." % (_name or "a file"))
+            new.insert_pdf(src)
+            src.close()
+            progress_step(_i + 1)
+    finally:
+        progress_end()
     if new.page_count == 0:
         raise RuntimeError("No pages to merge.")
     # the merge replaces the open document — snapshot it first so Undo can
@@ -970,6 +1198,10 @@ def compress(level="medium"):
 
     target_kb, steps = COMPRESS_PRESETS.get(level, COMPRESS_PRESETS["medium"])
     target = target_kb * 1024
+    # One step for the lossless pass, plus up to len(steps) image trials.
+    progress_begin("compress", len(steps) + 1, "Optimising structure\u2026")
+    _trial_n = [0]
+    recompressed = [False]
 
     # 1) lossless structural pass — if it already fits the target, keep full quality
     plain_doc = fitz.open(stream=original, filetype="pdf")
@@ -979,6 +1211,7 @@ def compress(level="medium"):
         pass
     best = plain_doc.tobytes(garbage=4, deflate=True, deflate_fonts=True, clean=True)
     plain_doc.close()
+    progress_step(1, "Recompressing images\u2026")
 
     # 2) otherwise recompress images. Steps run gentle -> aggressive and produce
     #    monotonically smaller output, so we BINARY-SEARCH for the gentlest step
@@ -1002,6 +1235,8 @@ def compress(level="medium"):
             pass
         data = _save_optimized(trial)
         trial.close()
+        _trial_n[0] += 1
+        progress_step(min(1 + _trial_n[0], len(steps) + 1), "Recompressing images\u2026")
         return data
 
     if len(best) > target:
@@ -1012,6 +1247,7 @@ def compress(level="medium"):
             data = _try_step(mid)
             if len(data) < len(best):
                 best = data                        # track smallest as a fallback
+                recompressed[0] = True
             if len(data) <= target:
                 chosen = data
                 hi = mid - 1                       # a gentler step might also fit
@@ -1025,7 +1261,8 @@ def compress(level="medium"):
     STATE.snapshot("compress")
     STATE.doc.close()                          # free the pre-compress doc's memory
     STATE.doc = fitz.open(stream=best, filetype="pdf")
-    return before, len(best), target_kb
+    progress_end()
+    return before, len(best), target_kb, recompressed[0]
 
 
 def image_format(raw):
@@ -1134,8 +1371,10 @@ def create_from_images(images, quality="normal"):
     re-encodes as high-quality JPEG, but only keeps it when it's actually
     smaller than the original."""
     new = fitz.open()
+    progress_begin("images", len(images), "Building PDF\u2026")
     try:
-        for name, raw in images:
+        for _i, (name, raw) in enumerate(images):
+            progress_step(_i, "Adding \u201c%s\u201d\u2026" % (name or "image"))
             img, rect, raw = _open_image(name, raw)
             try:
                 if quality == "small":
@@ -1156,11 +1395,15 @@ def create_from_images(images, quality="normal"):
             page = new.new_page(width=rect.width, height=rect.height)
             page.show_pdf_page(page.rect, imgpdf, 0)
             imgpdf.close()
+            progress_step(_i + 1)
         if new.page_count == 0:
             raise RuntimeError("No valid images provided.")
     except Exception:
         new.close()                                 # don't leak a half-built doc
+        progress_end()
         raise
+    finally:
+        progress_end()
     # replaces the open document — keep it one Undo away, then close the live
     # doc so its memory is freed (Undo restores from the snapshot bytes).
     if STATE.doc is not None:
@@ -1299,6 +1542,12 @@ class Handler(BaseHTTPRequestHandler):
                         query[k] = v
 
             if path in ("/", "/index.html"):
+                # The page embeds the per-process CSRF token, so it is only
+                # served to the launcher-opened window: the launch URL carries
+                # a per-process boot secret. Another local process fetching "/"
+                # gets a 403 instead of a page it could mine the token from.
+                if not secrets.compare_digest(query.get("boot", ""), PAGE_BOOT):
+                    return self._err("Not authorised — open the PyPDF for Mac app instead.", 403)
                 html = INDEX_HTML.replace("__APP_NONCE__", APP_NONCE)
                 return self._send(200, html, "text/html; charset=utf-8")
 
@@ -1307,19 +1556,49 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/api/ping":
                 # Every ping is also a heartbeat: it tells the idle watchdog a
-                # browser tab is still open. Kept outside the document lock so the
-                # heartbeat keeps flowing even during a long operation.
+                # window is still open. Kept outside the document lock so the
+                # heartbeat keeps flowing even during a long operation. tabs_rev
+                # lets the window notice tabs opened by another launch (handoff).
                 HEARTBEAT["last"] = time.time()
                 HEARTBEAT["seen"] = True
-                return self._send(200, {"ok": True, "app": APP_TOKEN, "epoch": STATE.epoch})
+                return self._send(200, {"ok": True, "app": APP_TOKEN, "tabs_rev": TABS_REV})
 
-            # Everything below touches the document — serialise engine access.
+            # Everything below (progress included — its messages carry file
+            # names) requires the per-process token: as the X-PyPDF-Token
+            # header (fetch/XHR) or as ?k= for direct URL loads (<img>,
+            # downloads, the print fetch) which cannot set headers. Without
+            # it, any other local process or local user could read the open
+            # documents through these GETs. /api/ping above stays tokenless —
+            # single-instance discovery needs it and it exposes nothing.
+            if not (self._token_ok()
+                    or secrets.compare_digest(query.get("k", ""), APP_NONCE)):
+                return self._err("Missing or invalid request token.", 403)
+
+            if path == "/api/progress":
+                # Coarse progress for an in-flight long operation. Deliberately
+                # outside STATE_LOCK so it answers instantly while a compress /
+                # merge holds the document lock.
+                return self._send(200, {"ok": True,
+                    "active": PROGRESS["active"], "label": PROGRESS["label"],
+                    "cur": PROGRESS["cur"], "total": PROGRESS["total"],
+                    "msg": PROGRESS["msg"], "id": PROGRESS["id"]})
+
+            # Everything below touches a document — serialise engine access and
+            # bind STATE to the tab named in the request. Direct-URL loads
+            # (<img src>, print iframe, downloads) can't set a header, so they
+            # pass the tab as a ?tab= query param instead.
+            tab = self.headers.get("X-PyPDF-Tab", "") or query.get("tab", "")
             with STATE_LOCK:
+                bind_tab(tab, create=False)
                 return self._get_doc(path, query)
         except Exception as e:  # noqa
             return self._err(friendly_error(e), 500)
 
     def _get_doc(self, path, query):
+            if path == "/api/tabs":
+                # Authoritative, ordered list of open documents for the tab strip.
+                return self._send(200, {"ok": True, "tabs": tabs_summary(), "rev": TABS_REV})
+
             if path == "/api/state":
                 if STATE.locked:
                     return self._send(200, {
@@ -1337,6 +1616,8 @@ class Handler(BaseHTTPRequestHandler):
                     "path": STATE.path,
                     "size_kb": doc_size_kb(),
                     "can_undo": len(STATE.undo) > 0,
+                    "undo_depth": len(STATE.undo),
+                    "undo_label": STATE.undo[-1][0] if STATE.undo else "",
                     "dirty": STATE.dirty,
                 }
                 # Per-page sizes/rotations only change when the document does.
@@ -1439,19 +1720,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/open_path":
             # Hand-off from the launcher: authorise with the per-session secret
             # (read from a 0600 file) instead of the page token, which it can't know.
-            if self.headers.get("X-PyPDF-Handoff", "") != HANDOFF_SECRET:
+            if not secrets.compare_digest(
+                    self.headers.get("X-PyPDF-Handoff", ""), HANDOFF_SECRET):
                 return self._err("Unauthorised hand-off.", 403)
         elif not self._token_ok():
             return self._err("Missing or invalid request token.", 403)
         # Some POSTs don't change rendered content (just the saved-state flag), so
         # they must NOT bump the epoch — otherwise saving a copy would thrash the
         # render cache, drop search highlights, and make other tabs reload.
-        bump = path not in ("/api/mark_saved",)
+        # mark_saved only flips a flag; close removes the tab — neither should
+        # bump the active document's version counter.
+        bump = path not in ("/api/mark_saved", "/api/close")
         try:
             with STATE_LOCK:
+                # Bind STATE to the request's tab BEFORE touching epoch. A launcher
+                # hand-off (open_path) always lands in a brand-new tab; UI open-like
+                # actions may create the tab they name; everything else must address
+                # a tab that already exists.
+                tab = self.headers.get("X-PyPDF-Tab", "")
+                if path == "/api/open_path":
+                    bind_tab(_new_tab_id(), create=True)
+                elif path in _OPEN_ENDPOINTS:
+                    bind_tab(tab or _new_tab_id(), create=True)
+                else:
+                    bind_tab(tab, create=False)
                 # Optimistically bump the change counter; roll it back if the
                 # operation fails, so a failed request never thrashes the render
-                # cache or signals a phantom change to other tabs.
+                # cache or signals a phantom change.
                 if bump:
                     STATE.epoch += 1
                 resp = self._post_doc(path)
@@ -1502,12 +1797,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not STATE.path:
                     raise RuntimeError("This document isn't tied to a file on disk — use “Save a copy”.")
                 data = STATE.to_bytes()
+                # Atomic write (see atomic_write): a crash or full disk mid-write
+                # leaves the user's original file untouched rather than
+                # truncated/corrupted (this is the one destructive path).
+                target = STATE.path
                 try:
-                    with open(STATE.path, "wb") as fh:
-                        fh.write(data)
+                    atomic_write(target, data, keep_stat=True)
                 except OSError as e:
                     raise RuntimeError("Couldn't save to “%s” (%s)."
-                                       % (os.path.basename(STATE.path), e.strerror or "write error"))
+                                       % (os.path.basename(target), getattr(e, "strerror", None) or "write error"))
                 STATE.dirty = False
                 return self._send(200, {"ok": True, "path": STATE.path,
                                         "name": os.path.basename(STATE.path)})
@@ -1548,9 +1846,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "undone": label, "pages": STATE.doc.page_count})
 
             if path == "/api/close":
-                STATE.close()
-                _RENDER_CACHE.clear()
-                return self._send(200, {"ok": True, "epoch": STATE.epoch})
+                # Close just THIS tab: free its document + caches and drop it from
+                # the registry. The window reconciles its strip from /api/tabs.
+                tid = ACTIVE_TAB
+                close_tab(tid)
+                return self._send(200, {"ok": True, "closed": tid, "rev": TABS_REV})
 
             if path == "/api/authenticate":
                 # Provide the password for a PDF that was opened in a locked
@@ -1594,7 +1894,10 @@ class Handler(BaseHTTPRequestHandler):
                     level = "medium"
                 if level not in COMPRESS_PRESETS:
                     level = "medium"
-                before, after, target_kb = compress(level)
+                try:
+                    before, after, target_kb, recompressed = compress(level)
+                finally:
+                    progress_end()
                 STATE.dirty = True
                 pct = round(100 * (1 - after / before)) if before else 0
                 return self._send(200, {
@@ -1605,6 +1908,7 @@ class Handler(BaseHTTPRequestHandler):
                     "before_kb": round(before / 1024, 1),
                     "after_kb": round(after / 1024, 1),
                     "saved_pct": pct,
+                    "recompressed": bool(recompressed),
                 })
 
             if path == "/api/create_from_images":
@@ -1643,13 +1947,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e9ef; --muted:#8b93a3;
           --accent:#4f8cff; --accent2:#1f6feb; --ok:#3fb950; --warn:#d29922;
           --err:#f85149; --scrolltrack:#0b0d12; --scrollthumb:#3d6fd6; }
-  /* follow the macOS appearance setting */
+  /* shared light palette, applied either by the OS (auto) or an explicit pick */
+  :root[data-theme="light"],
+  :root:not([data-theme]) {}
   @media (prefers-color-scheme: light){
-    :root { --bg:#f2f3f6; --panel:#ffffff; --line:#d8dce4; --txt:#1d2533; --muted:#5c6575;
+    /* auto mode only: an explicit data-theme must not be overridden by the OS */
+    :root:not([data-theme]) { --bg:#f2f3f6; --panel:#ffffff; --line:#d8dce4; --txt:#1d2533; --muted:#5c6575;
             --accent:#2f6fe4; --accent2:#2f6fe4; --ok:#1a7f37; --warn:#9a6700;
             --err:#c93c37; --scrolltrack:#e4e7ee; --scrollthumb:#9db7e8; }
-    .stage { box-shadow:0 4px 18px rgba(30,40,60,.18); }
+    :root:not([data-theme]) .stage { box-shadow:0 4px 18px rgba(30,40,60,.18); }
   }
+  :root[data-theme="light"] { --bg:#f2f3f6; --panel:#ffffff; --line:#d8dce4; --txt:#1d2533; --muted:#5c6575;
+          --accent:#2f6fe4; --accent2:#2f6fe4; --ok:#1a7f37; --warn:#9a6700;
+          --err:#c93c37; --scrolltrack:#e4e7ee; --scrollthumb:#9db7e8; }
+  :root[data-theme="light"] .stage { box-shadow:0 4px 18px rgba(30,40,60,.18); }
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
          background:var(--bg); color:var(--txt); height:100vh; display:flex; flex-direction:column; }
@@ -1681,6 +1992,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .popover .opt:hover { background:var(--bg); }
   .popover .opt.cur { background:var(--accent2); color:#fff; }
   .popover .opt .sub { color:var(--muted); }
+  .popover .note { font-size:10.5px; color:var(--muted); line-height:1.45;
+                   padding:7px 10px 3px; border-top:1px solid var(--line); margin-top:4px; max-width:230px; }
   .popover .opt.cur .sub { color:#cfe0ff; }
   /* unified Find pill: magnifier · field · count · up/down · clear */
   .findpill { display:inline-flex; align-items:center; gap:3px; background:var(--bg);
@@ -1791,7 +2104,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .busy .spin { width:42px; height:42px; border-radius:50%;
                 border:4px solid rgba(255,255,255,.25); border-top-color:#fff;
                 animation:busyspin .9s linear infinite; }
-  .busy .bmsg { color:#fff; font-size:13px; }
+  .busy .bmsg { color:#fff; font-size:13px; max-width:80vw; text-align:center; }
+  .busy .bbar { display:none; width:220px; height:5px; border-radius:3px;
+                background:rgba(255,255,255,.22); overflow:hidden; }
+  .busy .bbar > i { display:block; height:100%; width:0%; background:#fff;
+                    border-radius:3px; transition:width .25s ease; }
   @keyframes busyspin { to { transform:rotate(360deg); } }
   .empty { color:var(--muted); text-align:center; margin-top:80px; font-size:14px; line-height:1.6; }
   .pagedots { display:flex; flex-wrap:wrap; gap:6px; }
@@ -1842,25 +2159,44 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .welcome .note { color:var(--muted); font-size:12px; line-height:1.7; margin-top:6px; }
   /* pages live in a wrapper so a pinch can scale them all live with one CSS transform */
   .pwrap { display:flex; flex-direction:column; align-items:safe center; gap:22px; width:100%; }
+  /* ---- Acrobat-style document tabs ---- */
+  .tabbar { display:flex; align-items:flex-end; gap:2px; padding:4px 8px 0; background:var(--panel);
+            border-bottom:1px solid var(--line); overflow-x:auto; min-height:0; }
+  .tabbar.empty { display:none; }
+  .tabbar::-webkit-scrollbar { height:0; }
+  .tab { display:inline-flex; align-items:center; gap:7px; max-width:220px; padding:6px 8px 6px 12px;
+         background:var(--bg); color:var(--muted); border:1px solid var(--line); border-bottom:none;
+         border-radius:8px 8px 0 0; cursor:pointer; font-size:12px; white-space:nowrap; flex:0 0 auto;
+         position:relative; top:1px; }
+  .tab:hover { color:var(--txt); }
+  .tab.active { background:var(--panel); color:var(--txt); border-color:var(--line);
+                box-shadow:0 -2px 0 var(--accent) inset; }
+  .tab .tname { overflow:hidden; text-overflow:ellipsis; max-width:160px; }
+  .tab .tdot { color:var(--warn); font-size:14px; line-height:1; margin-left:-2px; }   /* unsaved dot */
+  .tab .tx { display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px;
+             border-radius:5px; color:var(--muted); flex:0 0 auto; }
+  .tab .tx:hover { background:var(--line); color:var(--txt); }
+  .tab .tx svg { width:11px; height:11px; fill:none; stroke:currentColor; stroke-width:2.4; stroke-linecap:round; }
 </style>
 </head>
 <body>
 <header>
   <h1>📄 PyPDF for Mac</h1>
   <span class="meta" id="meta">No document open</span>
+  <button class="ghost" id="themeBtn" onclick="cycleTheme()" title="Theme" aria-label="Theme" style="padding:4px 9px">&#9680;</button>
   <button class="ghost" onclick="openAbout()" title="About this app" aria-label="About this app" style="padding:4px 9px">ⓘ</button>
 </header>
 
 <div class="toolbar" role="toolbar" aria-label="Document tools">
-  <button class="tile" onclick="guardThen(()=>fileInput.click())" title="Open a PDF" aria-label="Open a PDF"><svg class="ic" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span class="lbl">Open</span></button>
+  <button class="tile" onclick="fileInput.click()" title="Open a PDF" aria-label="Open a PDF"><svg class="ic" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span class="lbl">Open</span></button>
   <span class="sep"></span>
   <button class="ghost tile" id="editBtn" onclick="toggleEdit()" title="Edit — turn on to change text or place a signature (PDF opens read-only)" aria-label="Toggle edit mode" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg><span class="lbl">Edit</span></button>
   <button class="ghost tile" id="signBtn" onclick="toggleSign()" title="Place signature" aria-label="Place signature" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M3 17c3 0 3-7 6-7s2 5 4 5 2-3 5-3"/><path d="M3 21h18"/></svg><span class="lbl">Sign</span></button>
   <button class="ghost tile" id="undoBtn" onclick="undo()" title="Undo (⌘Z)" aria-label="Undo" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M3 7v6h6"/><path d="M3.5 13a9 9 0 1 0 2-7.4"/></svg><span class="lbl">Undo</span></button>
   <span class="sep"></span>
-  <button class="ghost tile" onclick="guardThen(()=>mergeInput.click())" title="Merge PDFs" aria-label="Merge PDFs"><svg class="ic" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg><span class="lbl">Merge</span></button>
-  <button class="ghost tile" onclick="guardThen(()=>imgInput.click())" title="Create a PDF from images" aria-label="Create from images"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span class="lbl">Images</span></button>
-  <button class="ghost tile" onclick="guardThen(()=>unlockInput.click())" title="Remove the password from a protected PDF" aria-label="Unlock PDF"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg><span class="lbl">Unlock</span></button>
+  <button class="ghost tile" onclick="mergeInput.click()" title="Merge PDFs" aria-label="Merge PDFs"><svg class="ic" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg><span class="lbl">Merge</span></button>
+  <button class="ghost tile" onclick="imgInput.click()" title="Create a PDF from images" aria-label="Create from images"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span class="lbl">Images</span></button>
+  <button class="ghost tile" onclick="unlockInput.click()" title="Remove the password from a protected PDF" aria-label="Unlock PDF"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg><span class="lbl">Unlock</span></button>
   <button class="ghost tile" id="orgBtn" onclick="openOrganize()" title="Organize pages — reorder, rotate, delete" aria-label="Organize pages" disabled><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg><span class="lbl">Organize</span></button>
   <button class="ghost tile" id="copyBtn" onclick="openCopyPages()" title="Copy chosen pages into a new PDF" aria-label="Copy pages" disabled><svg class="ic" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span class="lbl">Copy</span></button>
   <button class="ghost tile" id="textBtn" onclick="openTextModal()" title="View and copy the document's text" aria-label="View text" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg><span class="lbl">Text</span></button>
@@ -1894,17 +2230,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <button class="ghost tile" id="pngBtn" onclick="exportPng()" title="Export the current page as a PNG image" aria-label="Export page as PNG" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg><span class="lbl">PNG</span></button>
   <button class="ghost tile" id="printBtn" onclick="printDoc()" title="Print the document" aria-label="Print" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg><span class="lbl">Print</span></button>
   <span class="sep"></span>
-  <button class="tile" id="saveBtn" onclick="openSaveModal()" title="Save / download the PDF" aria-label="Save" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg><span class="lbl">Save</span></button>
-  <button class="ghost tile" id="closeBtn" onclick="closeDoc()" title="Close the open document" aria-label="Close document" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg><span class="lbl">Close</span></button>
+  <button class="tile" id="saveBtn" onclick="saveDoc()" title="Save the PDF" aria-label="Save" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg><span class="lbl">Save</span></button>
+  <button class="ghost tile" id="closeBtn" onclick="closeDoc()" title="Close the current tab" aria-label="Close current tab" disabled><svg class="ic" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg><span class="lbl">Close</span></button>
 </div>
+
+<div class="tabbar empty" id="tabbar" role="tablist" aria-label="Open documents"></div>
 
 <div class="main">
   <div class="viewer" id="viewer">
     <div class="empty" id="emptyMsg">
       <div class="welcome">
         <div style="font-size:16px;color:var(--txt);font-weight:600">What would you like to do?</div>
-        <button class="big" onclick="guardThen(()=>fileInput.click())">📄 Open a PDF</button>
-        <button class="big ghost" onclick="guardThen(()=>imgInput.click())">🖼 Create a PDF from images</button>
+        <button class="big" onclick="fileInput.click()">📄 Open a PDF</button>
+        <button class="big ghost" onclick="imgInput.click()">🖼 Create a PDF from images</button>
         <div class="note">Everything stays on your Mac — nothing is uploaded.<br>
         Tip: drag a PDF (or images) anywhere into this window.<br>
         PDFs open read-only — turn on “✎ Edit” to change text or sign · pinch or double-click to zoom.</div>
@@ -1921,8 +2259,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="ghost" id="clearSigBtn" onclick="clearSignature()" title="Remove the loaded signature" style="display:none">✕ Clear</button>
     </div>
     <img id="sigPreview" alt="signature" draggable="false">
-    <!-- kept for the API but hidden: signatures are placed as-is (off by default) -->
-    <label class="check" style="display:none"><input type="checkbox" id="sigKnockout"> Remove white background</label>
+    <!-- hidden but ON by default: signatures get their paper background knocked
+         out so the ink blends onto the page (like Adobe Sign / the PWA build) -->
+    <label class="check" style="display:none"><input type="checkbox" id="sigKnockout" checked> Remove white background</label>
     <div class="hint">Turn on “✎ Edit”, click “Place Signature”, then drag a box on the page. Move the box or drag its corner to resize, then click <b>Place</b>. Use “Undo” to remove it later.</div>
 
     <h2>Edit text</h2>
@@ -1947,7 +2286,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="status" id="status" role="status" aria-live="polite">Ready.</div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true"></div></div>
-<div class="busy" id="busy" role="alertdialog" aria-busy="true" aria-label="Working"><div class="spin"></div><div class="bmsg" id="busyMsg">Working…</div><button class="ghost" id="busyCancel" style="display:none;margin-top:14px">Cancel</button></div>
+<div class="busy" id="busy" role="alertdialog" aria-busy="true" aria-label="Working"><div class="spin"></div><div class="bmsg" id="busyMsg">Working…</div><div class="bbar" id="busyBar"><i></i></div><button class="ghost" id="busyCancel" style="display:none;margin-top:14px">Cancel</button></div>
 
 <input type="file" id="fileInput" accept="application/pdf,image/*" style="display:none">
 <input type="file" id="mergeInput" accept="application/pdf" multiple style="display:none">
@@ -1980,15 +2319,188 @@ function setStatus(m, k=""){ const s=$("status"); s.textContent=m; s.className="
 function esc(s){ return String(s).replace(/[&<>"']/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
+// ===========================================================================
+// Document tabs (Acrobat-style). Each open PDF is its own backend document,
+// addressed by a tab id sent on every request. The live globals above describe
+// the ACTIVE tab; switching saves a small UI snapshot (zoom + scroll) and loads
+// the target tab's state from the server.
+// ===========================================================================
+let TABS = [];            // mirror of /api/tabs: [{id,name,dirty,open,locked,pages}]
+let activeTab = null;     // id of the tab whose document is on screen
+let _tabsRev = -1;        // last tabs revision we reconciled
+const tabUI = {};         // id -> {zoom, scroll}  (per-tab view snapshot)
+
+function newTabId(){ return "t"+Math.random().toString(36).slice(2,10); }
+
+// Tab query suffix for URLs loaded OUTSIDE api() — <img src>, the print iframe,
+// and download links — which can't send the X-PyPDF-Tab header. The server
+// falls back to this ?tab= value so the right document is rendered. It also
+// carries the request token (k=): the server requires it on every document GET
+// (so other local processes can't read documents), and headerless URL loads
+// have no other way to present it.
+function tq(){ return "&tab="+encodeURIComponent(activeTab||"")+"&k="+encodeURIComponent(APP_NONCE); }
+
+// True when running inside the native window (pywebview), where browser-style
+// downloads don't work and we use the native save bridge instead.
+function isNative(){ return !!(window.pywebview && window.pywebview.api); }
+
+// Call an endpoint against a SPECIFIC tab (overrides the active-tab default).
+function apiTab(tabId, path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers, {"X-PyPDF-Tab": tabId});
+  return api(path, opts);
+}
+
+function renderTabs(){
+  const bar=$("tabbar");
+  if(!TABS.length){ bar.className="tabbar empty"; bar.innerHTML=""; return; }
+  bar.className="tabbar"; bar.innerHTML="";
+  for(const t of TABS){
+    const el=document.createElement("div");
+    el.className="tab"+(t.id===activeTab?" active":"");
+    el.setAttribute("role","tab"); el.title=t.name;
+    const dot = t.dirty ? '<span class="tdot" title="Unsaved changes">&#9679;</span>' : '';
+    el.innerHTML = dot+'<span class="tname">'+esc(t.name)+'</span>'+
+      '<span class="tx" role="button" aria-label="Close tab" title="Close tab">'+
+      '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span>';
+    el.onclick=(e)=>{ if(e.target.closest(".tx")) return; switchTab(t.id); };
+    el.querySelector(".tx").onclick=(e)=>{ e.stopPropagation(); closeTab(t.id); };
+    bar.appendChild(el);
+  }
+}
+
+// Keep the active tab's chip (name + unsaved dot) in step with the live mirror,
+// without a server round-trip. Called from refreshMeta after every operation.
+function syncActiveTabMeta(){
+  const t=TABS.find(x=>x.id===activeTab);
+  if(t){ t.dirty=dirty; if(curName) t.name=curName; renderTabs(); }
+}
+
+async function refreshTabs(){
+  try{
+    const j=await api("/api/tabs");
+    TABS=j.tabs||[]; _tabsRev=j.rev;
+    for(const id of Object.keys(tabUI)){ if(!TABS.find(t=>t.id===id)) delete tabUI[id]; }
+    if(activeTab && !TABS.find(t=>t.id===activeTab)) activeTab=null;
+    renderTabs();
+  }catch(e){ /* server not reachable */ }
+}
+
+function snapshotActive(){
+  if(!activeTab) return;
+  tabUI[activeTab]={ zoom:zoomMult, scroll:$("viewer").scrollTop };
+}
+
+// Wipe the live document globals so a freshly-selected/created tab starts clean.
+function resetLive(){
+  pages=0; cur=0; dirty=false; curName="document.pdf"; curPath="";
+  sizes=[]; rots=[]; _sizesEpoch=-1; curEpoch=-1; spansByPage={}; scaleByPage={};
+  selPage=-1; selIdx=-1; findMatches=[]; findIdx=-1; _findEpoch=-1; _lastFindQ="";
+  if($("findBox")) $("findBox").value=""; clearFinds();
+  editMode=false; signMode=false;
+  const v=$("viewer"); v.querySelectorAll(".stage").forEach(s=>s.remove());
+  if(pageObserver){ pageObserver.disconnect(); pageObserver=null; }
+}
+
+// Load the active tab's document from the server and render it.
+async function loadActiveTab(){
+  const saved=tabUI[activeTab]||{};
+  const _defZoom=(()=>{ let z=1.0; try{ z=parseFloat(localStorage.getItem("zoom"))||1.0; }catch(e){} return Math.min(3,Math.max(0.5,z)); })();
+  resetLive();
+  zoomMult = saved.zoom || _defZoom;
+  let st=null;
+  try{ st=await api("/api/state"); }catch(e){}
+  if(st && st.locked){
+    $("emptyMsg").style.display="none";
+    await promptUnlock(st.filename); return;
+  }
+  if(st && st.open){
+    curEpoch=(typeof st.epoch==="number")?st.epoch:-1;
+    pages=st.pages; cur=0;
+    await rebuild(); setEdit(false);
+    if(saved.scroll){ const v=$("viewer"); requestAnimationFrame(()=>{ v.scrollTop=saved.scroll; }); }
+    setStatus("","");
+  } else {
+    resetToEmpty();
+  }
+}
+
+async function switchTab(id){
+  if(id===activeTab) return;
+  snapshotActive();
+  activeTab=id; renderTabs();
+  await loadActiveTab();
+}
+
+// Open something in a brand-new tab. doOpen() performs the actual /api/open*
+// POST, which the backend lands in the new tab (its header carries the id).
+async function openInNewTab(doOpen){
+  snapshotActive();
+  const prev=activeTab;
+  const id=newTabId();
+  activeTab=id; resetLive(); $("emptyMsg").style.display="none";
+  try{ await doOpen(); }catch(e){ /* doOpen reports its own errors */ }
+  await refreshTabs();
+  const t=TABS.find(x=>x.id===id);
+  if(!t || (!t.open && !t.locked)){
+    // failed or cancelled before any document loaded — discard the empty tab
+    try{ await apiTab(id,"/api/close",{method:"POST"}); }catch(e){}
+    activeTab = (prev && TABS.find(x=>x.id===prev)) ? prev
+              : (TABS.length ? TABS[TABS.length-1].id : null);
+    await refreshTabs();
+    if(activeTab) await loadActiveTab(); else resetToEmpty();
+    return;
+  }
+  renderTabs();
+}
+
+async function closeTab(id){
+  const t=TABS.find(x=>x.id===id);
+  const finish=async()=>{
+    const idx=TABS.findIndex(x=>x.id===id);
+    const wasActive=(id===activeTab);
+    try{ await apiTab(id,"/api/close",{method:"POST"}); }catch(e){}
+    delete tabUI[id];
+    await refreshTabs();
+    if(wasActive){
+      if(TABS.length){ activeTab=TABS[Math.min(idx,TABS.length-1)].id; renderTabs(); await loadActiveTab(); }
+      else { activeTab=null; resetToEmpty(); renderTabs(); }
+    }
+  };
+  if(t && t.dirty){
+    if(id!==activeTab) await switchTab(id);   // show what's about to be discarded
+    guardThen(finish);                        // unsaved-changes prompt
+  } else {
+    await finish();
+  }
+}
+
 // ---------- busy overlay (long operations) ----------
 // Shows after 250ms so quick operations never flicker; blocks stray clicks
 // while the engine is working.
 let _busyT=null;
+let _progT=null;
+function startProgressPoll(){
+  stopProgressPoll();
+  _progT=setInterval(async()=>{
+    let p; try{ const r=await fetch("/api/progress",{headers:{"X-PyPDF-Token":APP_NONCE}}); p=await r.json(); }catch(e){ return; }
+    const bar=$("busyBar");
+    if(p && p.active && p.total>0){
+      const cur=Math.min(p.cur,p.total), pct=Math.round(100*cur/p.total);
+      if(bar){ bar.style.display="block"; bar.firstElementChild.style.width=pct+"%"; }
+      if(p.msg) $("busyMsg").textContent=p.msg+"  ("+cur+"/"+p.total+")";
+    } else if(bar){ bar.style.display="none"; bar.firstElementChild.style.width="0%"; }
+  },300);
+}
+function stopProgressPoll(){
+  if(_progT){ clearInterval(_progT); _progT=null; }
+  const bar=$("busyBar"); if(bar){ bar.style.display="none"; bar.firstElementChild.style.width="0%"; }
+}
 function busy(msg){
   clearTimeout(_busyT);
-  _busyT=setTimeout(()=>{ $("busyMsg").textContent=msg||"Working…"; $("busy").classList.add("show"); },250);
+  _busyT=setTimeout(()=>{ $("busyMsg").textContent=msg||"Working…"; $("busy").classList.add("show"); startProgressPoll(); },250);
 }
-function unbusy(){ clearTimeout(_busyT); _busyT=null; $("busy").classList.remove("show"); }
+function unbusy(){ clearTimeout(_busyT); _busyT=null; stopProgressPoll(); $("busy").classList.remove("show"); }
 
 // ---------- unsaved-changes protection ----------
 let dirty = false;           // mirrors the server's dirty flag
@@ -2011,7 +2523,7 @@ function guardThen(action){
       <button id="guardSave">Save first</button>
     </div>`;
   $("guardContinue").onclick=()=>{ closeModal(); action(); };
-  $("guardSave").onclick=()=>{ openSaveModal(action); };
+  $("guardSave").onclick=()=>{ saveDoc(action); };
   $("overlay").classList.add("show");
 }
 
@@ -2022,8 +2534,11 @@ window.addEventListener("beforeunload", e=>{
 let _localOps=0, _lastLocalOp=0;   // track in-flight local mutations (POSTs)
 async function api(path, opts){
   opts = opts || {};
-  // Attach the CSRF token to every API call (harmless on GETs, required on POSTs).
-  opts.headers = Object.assign({}, opts.headers, {"X-PyPDF-Token": APP_NONCE});
+  // Attach the active tab (so the server binds the right document) and the CSRF
+  // token to every API call. A caller-supplied X-PyPDF-Tab (apiTab) wins over
+  // the active-tab default; the token is always forced.
+  opts.headers = Object.assign({"X-PyPDF-Tab": activeTab||""}, opts.headers);
+  opts.headers["X-PyPDF-Token"] = APP_NONCE;
   const isPost = String(opts.method||"").toUpperCase()==="POST";
   // Every POST carries a body + content-type (matches the rest, avoids any
   // bodyless-POST quirk).
@@ -2119,9 +2634,11 @@ async function createFromImageFiles(files){
   }catch(err){ setStatus(err.message,"err"); }
   finally{ unbusy(); }
 }
-$("fileInput").onchange = e => { const f=e.target.files[0]; e.target.value=""; if(f) openPdfFile(f); };
+// Open / Images always create a NEW tab (Acrobat behaviour) — nothing is
+// replaced, so no unsaved-changes guard is needed here.
+$("fileInput").onchange = e => { const f=e.target.files[0]; e.target.value=""; if(f) openInNewTab(()=>openPdfFile(f)); };
 $("mergeInput").onchange = e => { const files=[...e.target.files]; e.target.value=""; if(files.length) startMerge(files); };
-$("imgInput").onchange = e => { const files=[...e.target.files]; e.target.value=""; if(files.length) createFromImageFiles(files); };
+$("imgInput").onchange = e => { const files=[...e.target.files]; e.target.value=""; if(files.length) openInNewTab(()=>createFromImageFiles(files)); };
 
 // ---------- drag & drop anywhere onto the window ----------
 // One PDF opens it; several PDFs open the merge dialog; images become a new
@@ -2147,9 +2664,9 @@ window.addEventListener("drop", e=>{
   if(!files.length) return;
   const pdfs=files.filter(f=>/\.pdf$/i.test(f.name));
   const imgs=files.filter(f=>/\.(png|jpe?g)$/i.test(f.name));
-  if(pdfs.length===1 && !imgs.length)      guardThen(()=>openPdfFile(pdfs[0]));
-  else if(pdfs.length>1 && !imgs.length)   guardThen(()=>startMerge(pdfs));
-  else if(imgs.length && !pdfs.length)     guardThen(()=>createFromImageFiles(imgs));
+  if(pdfs.length===1 && !imgs.length)      openInNewTab(()=>openPdfFile(pdfs[0]));
+  else if(pdfs.length>1 && !imgs.length)   startMerge(pdfs);
+  else if(imgs.length && !pdfs.length)     openInNewTab(()=>createFromImageFiles(imgs));
   else setStatus("Drop PDFs or images — not a mix of both.","err");
 });
 
@@ -2159,8 +2676,8 @@ document.addEventListener("keydown", e=>{
   const mod=e.metaKey||e.ctrlKey;
   const tag=(e.target&&e.target.tagName)||"";
   const inField=/^(INPUT|TEXTAREA|SELECT)$/.test(tag);
-  if(mod && (e.key==="s"||e.key==="S")){ e.preventDefault(); if(pages>0) openSaveModal(); return; }
-  if(mod && (e.key==="o"||e.key==="O")){ e.preventDefault(); guardThen(()=>fileInput.click()); return; }
+  if(mod && (e.key==="s"||e.key==="S")){ e.preventDefault(); if(pages>0) saveDoc(); return; }
+  if(mod && (e.key==="o"||e.key==="O")){ e.preventDefault(); fileInput.click(); return; }
   if(mod && (e.key==="f"||e.key==="F")){ e.preventDefault(); if(pages>0){ const fb=$("findBox"); fb.focus(); fb.select(); } return; }
   if(mod && (e.key==="z"||e.key==="Z") && !inField){ e.preventDefault(); if(pages>0 && !$("undoBtn").disabled) undo(); return; }
   if(mod || inField || pages<=0) return;
@@ -2173,18 +2690,29 @@ document.addEventListener("keydown", e=>{
 
 $("unlockInput").onchange = async e => {
   const f=e.target.files[0]; e.target.value=""; if(!f) return;
-  // Most protected PDFs need the user password; ask for it. An empty entry
-  // still works for files locked only with an owner (permissions) password.
-  const pw = prompt("Password for \""+f.name+"\"\n(leave blank if it only has owner/permission restrictions):", "");
-  if(pw===null) return;  // cancelled
-  setStatus("Unlocking "+f.name+" ...");
-  try{ const j=await api("/api/unlock",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({filename:f.name,data_b64:await fileToB64(f),password:pw})});
-    pages=j.pages; cur=0; await rebuild(); setEdit(false);   // open read-only
-    setStatus(j.was_encrypted
-      ? "Unlocked "+f.name+" ("+pages+" pages). Save to keep the password-free copy."
-      : f.name+" was not password-protected; opened as-is ("+pages+" pages).","ok");
-  }catch(err){ setStatus(err.message,"err"); }
+  const b64=await fileToB64(f);
+  await openInNewTab(async ()=>{
+    let err="";
+    while(true){
+      // Masked password prompt; empty is fine for owner/permissions-only locks.
+      const pw = await askPassword(f.name, err);
+      if(pw===null){ throw new Error("__cancelled__"); }   // -> empty tab discarded
+      setStatus("Unlocking "+f.name+" …");
+      try{
+        const j=await api("/api/unlock",{method:"POST",headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({filename:f.name,data_b64:b64,password:pw})});
+        pages=j.pages; cur=0; await rebuild(); setEdit(false);   // open read-only
+        setStatus(j.was_encrypted
+          ? "Unlocked "+f.name+" ("+pages+" pages). Save to keep the password-free copy."
+          : f.name+" was not password-protected; opened as-is ("+pages+" pages).","ok");
+        return;
+      }catch(ex){
+        const m=(ex&&ex.message||"").toLowerCase();
+        if(m.includes("password")){ err="Incorrect password — try again."; continue; }  // re-prompt
+        throw ex;   // a different failure — let openInNewTab discard the tab
+      }
+    }
+  });
 };
 
 $("sigInput").onchange = async e => {
@@ -2224,7 +2752,14 @@ async function refreshMeta(){
   $("meta").textContent=st.filename+"  •  "+st.pages+" pages  •  "+st.size_kb+" KB"+(dirty?"  •  Edited":"");
   $("docInfo").textContent=st.filename+" — "+st.pages+" pages, "+st.size_kb+" KB";
   const dp=$("docPath"); if(dp){ dp.textContent = st.path ? st.path : "(opened from upload — no file path)"; }
-  $("undoBtn").disabled=!st.can_undo;
+  const ub=$("undoBtn"); ub.disabled=!st.can_undo;
+  if(st.can_undo){
+    const lbl=st.undo_label?("Undo "+st.undo_label):"Undo last change";
+    const depth=(st.undo_depth>1)?(" \u2014 "+st.undo_depth+" steps available"):"";
+    ub.title=lbl+depth+" (\u2318Z)";
+  } else { ub.title="Undo (\u2318Z)"; }
+  ub.setAttribute("aria-label", ub.title);
+  syncActiveTabMeta();   // keep this tab's chip (name + unsaved dot) current
 }
 
 let pageObserver=null;
@@ -2259,7 +2794,7 @@ async function rebuild(){
     img.onload=()=>{ img.style.height="auto"; scaleByPage[i]= sizes[i] ? tw/sizes[i][0] : 1;
       if(editMode) drawSpans(stage,i);   // spans only matter (and are only clickable) in Edit mode
       drawFinds(stage,i); };             // search highlights, if any matches on this page
-    img.dataset.src="/api/page?n="+i+"&w="+renderWidth(tw)+"&t="+Date.now();
+    img.dataset.src="/api/page?n="+i+"&w="+renderWidth(tw)+"&t="+Date.now()+tq();
     attachSign(stage, i);
     w.appendChild(stage);
     pageObserver.observe(stage);
@@ -2274,7 +2809,7 @@ async function reloadPage(i){
   img.style.width=tw+"px";
   img.onload=()=>{ scaleByPage[i]= sizes[i] ? tw/sizes[i][0] : 1;
     if(editMode) drawSpans(stage,i); drawFinds(stage,i); };
-  img.src="/api/page?n="+i+"&w="+renderWidth(tw)+"&t="+Date.now();
+  img.src="/api/page?n="+i+"&w="+renderWidth(tw)+"&t="+Date.now()+tq();
   await refreshMeta();
 }
 
@@ -2335,7 +2870,7 @@ function drawFinds(stage,i){
 }
 function updateFindUI(){
   const n=findMatches.length;
-  $("findCount").textContent = n ? ((findIdx+1)+"/"+n) : (($("findBox").value||"").trim()?"0":"");
+  $("findCount").textContent = n ? ((findIdx+1)+" of "+n) : (($("findBox").value||"").trim()?"No matches":"");
   $("findPrev").disabled = n<2; $("findNext").disabled = n<2;
 }
 function markCurrentFind(){
@@ -2410,35 +2945,41 @@ function setSign(on){
   document.querySelectorAll(".stage").forEach(s=>s.classList.toggle("signing",signMode));
   setStatus(signMode ? "Sign mode ON — drag a box where the signature should go." : "Sign mode off.", signMode?"ok":"");
 }
+// One signature drag at a time, tracked module-wide so a SINGLE window mouseup
+// listener (below) can finish it. The old per-stage version added a new window
+// listener for every page on EVERY rebuild (zoom/resize/operation) and never
+// removed them — thousands of leaked closures over a long session on a large
+// document, each also pinning removed stage DOM against GC.
+let _signDrag=null;   // {stage, i, start:{x,y}, rectEl}
 function attachSign(stage, i){
-  let start=null, rectEl=null;
   const img=()=>stage.querySelector("img");
   stage.addEventListener("mousedown", e=>{
     if(!signMode || e.button!==0 || _sigPreview) return;   // a preview is being positioned
     const b=img().getBoundingClientRect();
-    start={x:e.clientX-b.left, y:e.clientY-b.top};
-    rectEl=document.createElement("div"); rectEl.className="selrect"; stage.appendChild(rectEl);
+    const rectEl=document.createElement("div"); rectEl.className="selrect"; stage.appendChild(rectEl);
+    _signDrag={stage, i, start:{x:e.clientX-b.left, y:e.clientY-b.top}, rectEl};
     e.preventDefault();
   });
   stage.addEventListener("mousemove", e=>{
-    if(!start||!rectEl) return;
+    const D=_signDrag; if(!D || D.stage!==stage) return;
     const b=img().getBoundingClientRect();
     const x=e.clientX-b.left, y=e.clientY-b.top;
-    rectEl.style.left=Math.min(start.x,x)+"px"; rectEl.style.top=Math.min(start.y,y)+"px";
-    rectEl.style.width=Math.abs(x-start.x)+"px"; rectEl.style.height=Math.abs(y-start.y)+"px";
-  });
-  window.addEventListener("mouseup", e=>{
-    if(!start||!rectEl) return;
-    const b=img().getBoundingClientRect();
-    const x=e.clientX-b.left, y=e.clientY-b.top;
-    const px0=Math.min(start.x,x), py0=Math.min(start.y,y), pw=Math.abs(x-start.x), ph=Math.abs(y-start.y);
-    start=null; const el=rectEl; rectEl=null; el.remove();
-    if(pw<8||ph<8){ return; }
-    // Don't commit yet — drop a movable/resizable preview so the user can place
-    // the signature exactly before it's burned in.
-    startSigPreview(stage, i, px0, py0, pw, ph);
+    D.rectEl.style.left=Math.min(D.start.x,x)+"px"; D.rectEl.style.top=Math.min(D.start.y,y)+"px";
+    D.rectEl.style.width=Math.abs(x-D.start.x)+"px"; D.rectEl.style.height=Math.abs(y-D.start.y)+"px";
   });
 }
+window.addEventListener("mouseup", e=>{
+  const D=_signDrag; if(!D) return;
+  _signDrag=null; D.rectEl.remove();
+  if(!document.body.contains(D.stage)) return;            // stage was rebuilt mid-drag
+  const b=D.stage.querySelector("img").getBoundingClientRect();
+  const x=e.clientX-b.left, y=e.clientY-b.top;
+  const px0=Math.min(D.start.x,x), py0=Math.min(D.start.y,y), pw=Math.abs(x-D.start.x), ph=Math.abs(y-D.start.y);
+  if(pw<8||ph<8) return;
+  // Don't commit yet — drop a movable/resizable preview so the user can place
+  // the signature exactly before it's burned in.
+  startSigPreview(D.stage, D.i, px0, py0, pw, ph);
+});
 
 // ---------- signature placement preview (drag to move · corner to resize) ----
 // State (x/y/w/h in display px, relative to the page image) is tracked
@@ -2582,6 +3123,7 @@ function zoomTo(mult, cy){
   if(cy===undefined) cy=v.clientHeight/2;
   const frac=(v.scrollTop+cy)/Math.max(1,w.scrollHeight);
   zoomMult=mult;
+  try{ localStorage.setItem("zoom", String(zoomMult)); }catch(e){}
   rebuild().then(()=>{ v.scrollTop=Math.max(0, frac*w.scrollHeight - cy); });
 }
 
@@ -2776,16 +3318,23 @@ function mMove(i,d){ const j=i+d; if(j<0||j>=mergeFiles.length) return;
 function mDel(i){ mergeFiles.splice(i,1); if(!mergeFiles.length){ closeModal(); return; } renderMergeModal(); }
 async function doMerge(){
   if(!mergeFiles.length) return;
-  setStatus("Merging "+mergeFiles.length+" file(s) ...");
-  busy("Merging "+mergeFiles.length+" file(s) …");
-  try{
-    const payload=mergeFiles.map(f=>({filename:f.name,data_b64:f.b64}));
-    const j=await api("/api/merge",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({files:payload, include_current:mergeIncludeCurrent})});
-    pages=j.pages; cur=0; closeModal(); await rebuild();
-    setStatus("Merged into one PDF ("+pages+" pages). Undo brings the previous document back.","ok");
-  }catch(err){ setStatus(err.message,"err"); }
-  finally{ unbusy(); }
+  const intoCurrent = mergeIncludeCurrent;   // capture before the modal closes
+  closeModal();
+  const run=async()=>{
+    setStatus("Merging "+mergeFiles.length+" file(s) ...");
+    busy("Merging "+mergeFiles.length+" file(s) …");
+    try{
+      const payload=mergeFiles.map(f=>({filename:f.name,data_b64:f.b64}));
+      const j=await api("/api/merge",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({files:payload, include_current:intoCurrent})});
+      pages=j.pages; cur=0; await rebuild();
+      await refreshTabs();
+      setStatus("Merged into one PDF ("+pages+" pages). Undo brings the previous document back.","ok");
+    }catch(err){ setStatus(err.message,"err"); }
+    finally{ unbusy(); }
+  };
+  // "Include current" merges into the open tab; otherwise the result is a new tab.
+  if(intoCurrent) await run(); else await openInNewTab(run);
 }
 
 // ---------- organize pages modal (thumbnails, drag-reorder, zoom) ----------
@@ -2811,7 +3360,7 @@ function renderOrganize(){
       <button class="delbtn" draggable="false" title="Remove this page"
         ${orgOrder.length<=1?"disabled":""}
         onclick="event.stopPropagation();orgDel(${pos})">✕</button>
-      <img data-url="/api/page?n=${pageIdx}&w=${renderWidth(thumbW)}" data-key="${curEpoch}:${pageIdx}:${renderWidth(thumbW)}"
+      <img data-url="/api/page?n=${pageIdx}&w=${renderWidth(thumbW)}${tq()}" data-key="${curEpoch}:${pageIdx}:${renderWidth(thumbW)}"
         alt="page ${pageIdx+1}" draggable="false"
         style="position:absolute;left:50%;top:50%;width:${imgW}px;background:#fff;
                transform:translate(-50%,-50%) rotate(${deg}deg)">
@@ -2862,7 +3411,7 @@ function renderCopyModal(){
          style="width:120px;height:${h}px;cursor:pointer">
       <span class="badge">${i+1}</span>
       ${copySel.has(i)?'<span class="pickmark">✓</span>':""}
-      <img data-url="/api/page?n=${i}&w=${renderWidth(120)}" data-key="${curEpoch}:${i}:${renderWidth(120)}"
+      <img data-url="/api/page?n=${i}&w=${renderWidth(120)}${tq()}" data-key="${curEpoch}:${i}:${renderWidth(120)}"
         width="120" alt="page ${i+1}" draggable="false" style="background:#fff">
     </div>`;}).join("");
   $("modal").innerHTML=`
@@ -2880,12 +3429,23 @@ function renderCopyModal(){
   lazyThumbs();
 }
 function copyToggle(i){ copySel.has(i)?copySel.delete(i):copySel.add(i); renderCopyModal(); }
-function doCopyPages(){
+async function doCopyPages(){
   if(!copySel.size) return;
-  const list=[...copySel].sort((a,b)=>a-b).join(",");
-  const n=copySel.size;
+  const sel=[...copySel].sort((a,b)=>a-b);
+  const n=sel.length;
   closeModal();
-  download("/api/copy_pages?pages="+list);
+  const name=(curName||"document").replace(/\.pdf$/i,"")+"_pages.pdf";
+  if(isNative()){
+    setStatus("Choose where to save the copied pages …");
+    try{
+      const r=await window.pywebview.api.save_copy_pages(activeTab||"", sel, name);
+      if(r && r.ok) setStatus("Saved "+n+" page(s) to “"+r.path+"”.","ok");
+      else if(r && r.cancelled) setStatus("Save cancelled.","");
+      else setStatus((r&&r.error)||"Couldn't save the pages.","err");
+    }catch(e){ setStatus("Couldn't save the pages.","err"); }
+    return;
+  }
+  download("/api/copy_pages?pages="+sel.join(",")+tq());
   setStatus("Copied "+n+" page(s) into a new PDF — download started.","ok");
 }
 
@@ -3001,7 +3561,8 @@ function openCompressMenu(){
   const pop=document.createElement("div"); pop.className="popover"; pop.id="compPop";
   pop.setAttribute("role","menu");
   pop.innerHTML='<div class="cap">COMPRESSION LEVEL</div>'+COMPRESS_OPTS.map(([v,n,s])=>
-    `<div class="opt${v===lastCompress?' cur':''}" role="menuitem" tabindex="0" data-v="${v}"><b style="font-weight:500">${n}</b><span class="sub">${s}</span></div>`).join("");
+    `<div class="opt${v===lastCompress?' cur':''}" role="menuitem" tabindex="0" data-v="${v}"><b style="font-weight:500">${n}</b><span class="sub">${s}</span></div>`).join("")
+    +'<div class="note">A lossless pass runs first. If the file is still over the target, images are downsampled and re-encoded as JPEG (lossy) — text stays sharp, photos and scans soften. Undo restores the original.</div>';
   document.body.appendChild(pop);
   const r=btn.getBoundingClientRect();
   pop.style.top=(r.bottom+6)+"px";
@@ -3026,14 +3587,29 @@ async function runCompress(level){
   try{ const j=await api("/api/compress",{method:"POST",
         headers:{"Content-Type":"application/json"}, body:JSON.stringify({level})});
     await rebuild();
-    const note = j.met_target ? "" :
+    let note = j.met_target ? "" :
       `  — couldn't get under ${j.target_kb} KB without dropping below readable quality; this is the smallest at this level`;
-    setStatus(`Compressed (${j.level}, target <${j.target_kb} KB): ${j.before_kb} KB → ${j.after_kb} KB  (${j.saved_pct}% smaller).`+note,"ok");
+    if(j.recompressed) note += "  Images were recompressed (lossy) to reach this size.";
+    setStatus(`Compressed (${j.level}, target <${j.target_kb} KB): ${j.before_kb} KB → ${j.after_kb} KB  (${j.saved_pct}% smaller).`+note, j.recompressed?"warn":"ok");
   }catch(err){ setStatus(err.message,"err"); }
   finally{ unbusy(); }
 }
 function download(path){ const a=$("dl"); a.href=path; a.download=""; a.click(); setStatus("Download started.","ok"); }
-function exportPng(){ download("/api/export_png?n="+cur+"&zoom=4.0"); }
+async function exportPng(){
+  if(pages<=0) return;
+  const name=(curName||"document").replace(/\.pdf$/i,"")+"_p"+(cur+1)+".png";
+  if(isNative()){
+    setStatus("Choose where to save the PNG …");
+    try{
+      const r=await window.pywebview.api.save_png(activeTab||"", cur, name);
+      if(r && r.ok) setStatus("Saved PNG to “"+r.path+"”.","ok");
+      else if(r && r.cancelled) setStatus("Save cancelled.","");
+      else setStatus((r&&r.error)||"Couldn't save the PNG.","err");
+    }catch(e){ setStatus("Couldn't save the PNG.","err"); }
+    return;
+  }
+  download("/api/export_png?n="+cur+"&zoom=4.0"+tq());
+}
 // ---------- print ----------
 // Prints the REAL PDF (vector) — the browser renders it natively at the
 // printer's own resolution, so text/lines stay perfectly sharp. The document
@@ -3044,11 +3620,20 @@ function exportPng(){ download("/api/export_png?n="+cur+"&zoom=4.0"); }
 let _printing=false;
 async function printDoc(){
   if(pages<=0 || _printing) return;       // guard against double-trigger
+  if(isNative()){
+    setStatus("Opening the print preview …");
+    try{
+      const r=await window.pywebview.api.print_pdf(activeTab||"");
+      if(r && r.ok) setStatus("Opened in Preview — use ⌘P there to print.","ok");
+      else setStatus((r&&r.error)||"Couldn't open the print preview.","err");
+    }catch(e){ setStatus("Couldn't open the print preview.","err"); }
+    return;
+  }
   _printing=true;
   setStatus("Preparing document for printing …","");
   try{
     // fit=1 -> content scaled to fill the page; cache-busted each time.
-    const res=await fetch(location.origin+"/api/pdf?fit=1&t="+Date.now());
+    const res=await fetch(location.origin+"/api/pdf?fit=1&t="+Date.now()+tq());
     if(!res.ok) throw new Error("HTTP "+res.status);
     const url=URL.createObjectURL(await res.blob());
     // Fresh hidden iframe every time — reusing one is what made the 2nd
@@ -3084,6 +3669,32 @@ async function printDoc(){
   }
 }
 
+// ---------- Save entry point ----------
+// In the native window we go STRAIGHT to the macOS save panel (no extra in-app
+// dialog — that was the "two dialogs" bug). In a browser we show the in-app
+// modal which then streams a download.
+function saveDoc(afterSave){
+  if(pages<=0) return;
+  if(isNative()){ nativeSave(curName, afterSave); return; }
+  openSaveModal(afterSave);
+}
+async function nativeSave(name, afterSave){
+  let nm=(name||curName||"document.pdf").trim();
+  if(!nm.toLowerCase().endsWith(".pdf")) nm+=".pdf";
+  setStatus("Choose where to save …");
+  try{
+    const r=await window.pywebview.api.save_pdf(activeTab||"", nm);
+    if(r && r.ok){
+      curName=r.name||nm; dirty=false;
+      api("/api/mark_saved",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({name:curName})}).then(()=>setTimeout(refreshMeta,200)).catch(()=>{});
+      setStatus("Saved “"+(r.name||nm)+"”.","ok");
+      if(typeof afterSave==="function") setTimeout(afterSave,200);
+    } else if(r && r.cancelled){ setStatus("Save cancelled.",""); }
+    else { setStatus((r&&r.error)||"Couldn't save the file.","err"); }
+  }catch(e){ setStatus("Couldn't save the file.","err"); }
+}
+
 // ---------- Save dialog (rename + download) ----------
 // afterSave: optional action to run once the save has started (used by the
 // unsaved-changes guard's "Save first" button to resume the original action).
@@ -3103,21 +3714,36 @@ function openSaveModal(afterSave){
       <input id="saveName" type="text" value="${esc(curName)}" spellcheck="false"
         style="width:100%;background:var(--bg);color:var(--txt);border:1px solid var(--line);
                border-radius:7px;padding:9px 10px;font-size:13px">
-      <div class="hint" style="margin-top:10px">A copy is downloaded to your Downloads
-        folder under this name; the original file on disk is not modified.</div>
+      <div class="hint" style="margin-top:10px">Save a copy under this name; the
+        original file on disk is not modified.</div>
     </div>
     <div class="mfoot">
       <button class="ghost" onclick="closeModal()">Cancel</button>
       <button id="saveGo">${hasPath?"Save a copy":"Save"}</button>
     </div>`;
-  const copy=()=>{
+  const copy=async ()=>{
     let name=($("saveName").value||"").trim() || curName;
     if(!name.toLowerCase().endsWith(".pdf")) name+=".pdf";
     closeModal();
-    download("/api/save?name="+encodeURIComponent(name));
+    if(isNative()){
+      // Native save panel — no browser download (which would navigate the window).
+      setStatus("Choose where to save the copy …");
+      try{
+        const r=await window.pywebview.api.save_pdf(activeTab||"", name);
+        if(r && r.ok){
+          curName=r.name||name; dirty=false;
+          api("/api/mark_saved",{method:"POST",headers:{"Content-Type":"application/json"},
+              body:JSON.stringify({name:curName})}).then(()=>setTimeout(refreshMeta,200)).catch(()=>{});
+          setStatus("Saved “"+(r.name||name)+"”.","ok");
+          if(typeof afterSave==="function") setTimeout(afterSave,200);
+        } else if(r && r.cancelled){ setStatus("Save cancelled.",""); }
+        else { setStatus((r&&r.error)||"Couldn't save the file.","err"); }
+      }catch(e){ setStatus("Couldn't save the file.","err"); }
+      return;
+    }
+    // Browser fallback: stream the copy as a download.
+    download("/api/save?name="+encodeURIComponent(name)+tq());
     curName=name; dirty=false;
-    // Record the name + clear dirty server-side via a tokened POST (the GET
-    // download no longer mutates state). Then refresh the header to match.
     api("/api/mark_saved",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({name})}).then(()=>setTimeout(refreshMeta,300)).catch(()=>{});
     setStatus("Saved a copy of “"+name+"” to Downloads.","ok");
@@ -3181,16 +3807,10 @@ async function openAbout(){
 }
 
 // ---------- Close PDF ----------
+// Closes the CURRENT tab (the strip's X closes any tab). closeTab handles the
+// unsaved-changes prompt and selecting a neighbouring tab.
 function closeDoc(){
-  if(pages<=0) return;
-  guardThen(async ()=>{
-    try{
-      const j=await api("/api/close",{method:"POST"});
-      if(typeof j.epoch==="number") curEpoch=j.epoch;
-      resetToEmpty();
-      setStatus("Document closed.","ok");
-    }catch(err){ setStatus(err.message,"err"); }
-  });
+  if(activeTab) closeTab(activeTab);
 }
 function resetToEmpty(){
   pages=0; cur=0; zoomMult=1.0; dirty=false; curName="document.pdf";
@@ -3239,6 +3859,35 @@ function clearFindBox(){
   $("findClear").style.display="none";
 }
 
+// ---------- masked password dialog (in-app, replaces prompt()) -------------
+// Returns the typed password, or null if cancelled. The input is type=password
+// so the characters are masked.
+function askPassword(name, err){
+  return new Promise(res=>{
+    $("modal").innerHTML=`
+      <div class="mhead"><h3>Password required</h3></div>
+      <div class="mbody">
+        ${err?`<div class="hint" style="color:var(--err);margin-bottom:10px;white-space:pre-line">${esc(err)}</div>`:""}
+        <div class="hint" style="margin-bottom:8px">“${esc(name)}” is password-protected.
+          Enter its password (leave blank if it only has an owner/permissions lock).</div>
+        <input id="pwBox" type="password" autocomplete="off" spellcheck="false"
+          style="width:100%;background:var(--bg);color:var(--txt);border:1px solid var(--line);
+                 border-radius:7px;padding:9px 10px;font-size:13px">
+      </div>
+      <div class="mfoot">
+        <button class="ghost" id="pwCancel">Cancel</button>
+        <button id="pwOk">Unlock</button>
+      </div>`;
+    _modalDismiss=()=>res(null);                      // Escape / backdrop = cancel
+    const ok=()=>{ const v=$("pwBox").value; _modalDismiss=null; closeModal(); res(v); };
+    const cancel=()=>{ _modalDismiss=null; closeModal(); res(null); };
+    $("pwOk").onclick=ok; $("pwCancel").onclick=cancel;
+    $("overlay").classList.add("show");
+    const inp=$("pwBox"); inp.focus();
+    inp.addEventListener("keydown",ev=>{ if(ev.key==="Enter"){ ev.preventDefault(); ok(); } });
+  });
+}
+
 // ---------- password prompt for locked PDFs --------------------------------
 let _unlocking=false;
 async function promptUnlock(fname){
@@ -3247,13 +3896,12 @@ async function promptUnlock(fname){
   $("emptyMsg").style.display="none";
   pages=0; updateButtons();
   setStatus("“"+fname+"” is password-protected.","warn");
-  let msg="";
+  let err="";
   try{
     while(true){
-      const pw = prompt(msg+"“"+fname+"” is password-protected.\nEnter the password (leave blank if it only has an owner/permissions lock):","");
+      const pw = await askPassword(fname, err);
       if(pw===null){
         setStatus("“"+fname+"” is locked — reopen it to enter the password.","warn");
-        try{ const pg=await api("/api/ping"); curEpoch=pg.epoch; }catch(e){}  // don't immediately re-prompt
         return;
       }
       const j = await api("/api/authenticate",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -3263,51 +3911,62 @@ async function promptUnlock(fname){
         setStatus("Unlocked "+j.filename+" ("+pages+" pages).","ok");
         return;
       }
-      msg="Incorrect password — try again.\n\n";
+      err="Incorrect password — try again.";
     }
   } finally { _unlocking=false; }
 }
 
-// ---------- auto-load a PDF passed on launch (macOS Open With / double-click) ----------
+// ---------- load any tabs already open on the server (launch / Open With) ------
+function applyTheme(t){
+  const r=document.documentElement;
+  if(t==="auto") r.removeAttribute("data-theme"); else r.setAttribute("data-theme",t);
+  try{ localStorage.setItem("theme",t); }catch(e){}
+  const b=document.getElementById("themeBtn");
+  if(b){
+    b.textContent = t==="light" ? "\u2600" : t==="dark" ? "\u263e" : "\u25d0";
+    b.title = "Theme: "+t+" (click to change)";
+    b.setAttribute("aria-label", b.title);
+  }
+}
+function currentTheme(){ try{ return localStorage.getItem("theme")||"auto"; }catch(e){ return "auto"; } }
+function cycleTheme(){ const t=currentTheme(); applyTheme(t==="auto"?"light":t==="light"?"dark":"auto"); }
+applyTheme(currentTheme());
+
 (async function boot(){
   try{
-    const st=await api("/api/state");
-    if(typeof st.epoch==="number") curEpoch=st.epoch;
-    if(st && st.locked){
-      await promptUnlock(st.filename);
-    } else if(st && st.open){
-      pages=st.pages; cur=0; await rebuild(); setEdit(false);
-      setStatus("Opened "+st.filename+" ("+pages+" pages).","ok");
+    await refreshTabs();
+    if(TABS.length){
+      activeTab=TABS[TABS.length-1].id; renderTabs();
+      await loadActiveTab();
+    } else {
+      activeTab=null; resetToEmpty();
     }
-  }catch(e){ /* no preloaded document */ }
+  }catch(e){ resetToEmpty(); }
 })();
 
 // ---------- single-instance: pick up PDFs opened into this running server ----
-// When another launch hands a new PDF to this server, the document version
-// (epoch) changes; this tab notices and loads it instead of opening a new tab.
+// When another launch hands a new PDF to the server it lands in a NEW tab and
+// bumps tabs_rev. This window notices, reconciles its strip, and switches to
+// the newly opened document.
 let _polling=false;
 async function pollForNewDoc(){
-  // don't fire while a local operation is running or just finished — its
-  // epoch bump is ours, not a new document opened from another launch.
-  // Also skip while the tab is hidden (no point polling in the background).
+  // Don't fire while a local operation is running or just finished — those tab
+  // changes are ours, already reconciled. Skip while the window is hidden.
   if(_polling || _localOps>0 || document.hidden || (Date.now()-_lastLocalOp)<1200) return;
   _polling=true;
   try{
     const pg=await api("/api/ping");
-    if(typeof pg.epoch==="number" && pg.epoch!==curEpoch){
-      const st=await api("/api/state");
-      curEpoch=pg.epoch;
-      if(st.locked){
+    if(typeof pg.tabs_rev==="number" && pg.tabs_rev!==_tabsRev){
+      const before=TABS.map(t=>t.id);
+      await refreshTabs();
+      const added=TABS.filter(t=>!before.includes(t.id));
+      if(added.length){
+        // a file opened from another launch (double-click) — bring it forward
+        await switchTab(added[added.length-1].id);
         try{ window.focus(); }catch(e){}
-        promptUnlock(st.filename);
-      } else if(st.open){
-        pages=st.pages; cur=0; await rebuild(); setEdit(false);
-        setStatus("Opened "+st.filename+" ("+pages+" pages).","ok");
-        try{ window.focus(); }catch(e){}
-      } else if(pages>0){
-        // The document was closed from another tab — clear this one too.
-        resetToEmpty();
-        setStatus("Document closed.","");
+      } else if(activeTab && !TABS.find(t=>t.id===activeTab)){
+        if(TABS.length){ activeTab=TABS[TABS.length-1].id; renderTabs(); await loadActiveTab(); }
+        else { activeTab=null; resetToEmpty(); }
       }
     }
   }catch(e){ /* server not reachable */ }
@@ -3384,6 +4043,18 @@ def _handoff_file(port):
     return os.path.join(tempfile.gettempdir(), "pypdf-handoff-%d.tok" % port)
 
 
+def _focus_running_app():
+    """Best-effort: bring the already-running app's window to the front.
+    A no-op when running from source (no installed .app)."""
+    for target in (["-a", "PyPDF for Mac"], ["-b", "com.pyedit.pdfeditor"]):
+        try:
+            subprocess.run(["open", *target], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except Exception:
+            continue
+
+
 def _handoff_to_instance(port, pdf_path):
     """Send a PDF to the running editor so it reuses the same server + tab."""
     secret = ""
@@ -3401,7 +4072,213 @@ def _handoff_to_instance(port, pdf_path):
     urllib.request.urlopen(req, timeout=5).read()
 
 
-def _idle_watchdog(server):
+class NativeApi:
+    """Bridge exposed to the page as window.pywebview.api.
+
+    A native window (WKWebView) can't trigger browser-style downloads — clicking
+    an <a download> just navigates the window to the URL. So Save / PNG / Copy /
+    Print are handled here instead: the bytes already live in Python, so we pop a
+    native macOS save panel and write the file directly. Each method takes the
+    active tab id and binds the right document before reading it."""
+
+    def _save_dialog(self, default_name, directory=""):
+        import webview
+        win = webview.windows[0] if webview.windows else None
+        if win is None:
+            return None
+        res = win.create_file_dialog(
+            webview.SAVE_DIALOG, directory=directory or "", save_filename=default_name)
+        if not res:
+            return None
+        return res[0] if isinstance(res, (list, tuple)) else res
+
+    def _bytes_for(self, tab, fn):
+        """Bind the tab, run fn() under the lock to get bytes, then release."""
+        with STATE_LOCK:
+            bind_tab(tab, create=False)
+            if STATE.doc is None:
+                return None
+            return fn()
+
+    def save_pdf(self, tab, name):
+        """Save the current document via a native save panel. When the document
+        was opened from disk, the panel defaults to that same folder + name, so
+        saving over it is a one-click overwrite."""
+        path_on_disk = ""
+        with STATE_LOCK:
+            bind_tab(tab, create=False)
+            if STATE.doc is None:
+                return {"ok": False, "error": "No PDF is open."}
+            data = STATE.to_bytes()
+            path_on_disk = STATE.path or ""
+        directory = os.path.dirname(path_on_disk) if path_on_disk else ""
+        default_name = name or (os.path.basename(path_on_disk) if path_on_disk else "document.pdf")
+        path = self._save_dialog(default_name, directory)
+        if not path:
+            return {"ok": False, "cancelled": True}
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        try:
+            atomic_write(path, data)
+        except OSError as e:
+            return {"ok": False, "error": "Couldn't write the file (%s)." % (e.strerror or e)}
+        # If the user saved over the original on-disk file, clear the unsaved flag.
+        with STATE_LOCK:
+            bind_tab(tab, create=False)
+            if (STATE.doc is not None and STATE.path
+                    and os.path.abspath(path) == os.path.abspath(STATE.path)):
+                STATE.dirty = False
+        return {"ok": True, "path": path, "name": os.path.basename(path)}
+
+    def save_png(self, tab, page, name):
+        png = self._bytes_for(tab, lambda: render_page(int(page), zoom=4.0, fmt="png")[0])
+        if png is None:
+            return {"ok": False, "error": "No PDF is open."}
+        path = self._save_dialog(name or "page.png")
+        if not path:
+            return {"ok": False, "cancelled": True}
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        try:
+            atomic_write(path, png)
+        except OSError as e:
+            return {"ok": False, "error": "Couldn't write the image (%s)." % (e.strerror or e)}
+        return {"ok": True, "path": path}
+
+    def save_copy_pages(self, tab, pages, name):
+        sel = [int(x) for x in pages]
+        data = self._bytes_for(tab, lambda: copy_pages(sel))
+        if data is None:
+            return {"ok": False, "error": "No PDF is open."}
+        path = self._save_dialog(name or "pages.pdf")
+        if not path:
+            return {"ok": False, "cancelled": True}
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        try:
+            atomic_write(path, data)
+        except OSError as e:
+            return {"ok": False, "error": "Couldn't write the file (%s)." % (e.strerror or e)}
+        return {"ok": True, "path": path}
+
+    def print_pdf(self, tab):
+        """Render the print-optimised PDF and hand it to the system (Preview),
+        where the standard macOS print panel is available."""
+        data = self._bytes_for(tab, lambda: build_print_pdf())
+        if data is None:
+            return {"ok": False, "error": "No PDF is open."}
+        tmp = os.path.join(tempfile.gettempdir(), "pypdf_print_%d.pdf" % int(time.time() * 1000))
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            # Open explicitly in Preview, NOT the default PDF app — this app IS
+            # the default PDF app, so a bare `open` would route the file back to
+            # us (and fail). Preview gives the user the standard print panel.
+            r = subprocess.run(["open", "-a", "Preview", tmp], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode != 0:
+                subprocess.run(["open", "-b", "com.apple.Preview", tmp], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:  # noqa
+            return {"ok": False, "error": "Couldn't open the print preview (%s)." % e}
+        return {"ok": True}
+
+
+NATIVE_API = NativeApi()
+
+# Retain the Apple-event handler object + its (once-defined) class for the
+# process lifetime. The object must not be GC'd or the handler stops firing.
+_ODOC_HANDLER = None
+_ODOC_CLASS = None
+
+
+def _build_odoc_class():
+    """Define the Objective-C odoc handler class exactly once (pyobjc forbids
+    re-registering a class name)."""
+    global _ODOC_CLASS
+    if _ODOC_CLASS is not None:
+        return _ODOC_CLASS
+    from Foundation import NSObject
+    from urllib.parse import urlparse, unquote
+
+    def fourcc(s):
+        return (ord(s[0]) << 24) | (ord(s[1]) << 16) | (ord(s[2]) << 8) | ord(s[3])
+
+    keyDirectObject = fourcc("----")
+    typeFileURL = fourcc("furl")
+
+    def _path_from_desc(desc):
+        try:
+            url = desc.coerceToDescriptorType_(typeFileURL)
+            if url is not None:
+                s = bytes(url.data()).decode("utf-8", "ignore")
+                p = unquote(urlparse(s).path)
+                if p:
+                    return p
+        except Exception:
+            pass
+        try:
+            txt = desc.stringValue()
+            if txt and os.path.exists(txt):
+                return txt
+        except Exception:
+            pass
+        return None
+
+    class _ODoc(NSObject):
+        def handleAppleEvent_withReplyEvent_(self, event, reply):
+            try:
+                lst = event.paramDescriptorForKeyword_(keyDirectObject)
+                if lst is None:
+                    return
+                for i in range(1, lst.numberOfItems() + 1):
+                    p = _path_from_desc(lst.descriptorAtIndex_(i))
+                    if p and os.path.isfile(p):
+                        try:
+                            open_file_as_new_tab(p)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    _ODOC_CLASS = _ODoc
+    return _ODOC_CLASS
+
+
+def _install_open_file_handler():
+    """Register our handler for the macOS 'open documents' (odoc) Apple event.
+
+    When this app is the default PDF handler and is ALREADY running, double-
+    clicking a PDF in Finder sends an odoc event to this process (macOS does NOT
+    launch a second copy). Without a handler, AppKit shows 'cannot open files in
+    the PDF Document format'. Registering our handler AFTER the GUI has launched
+    overrides AppKit's default. Safe to call repeatedly — it re-registers the
+    same retained handler object, which lets us win any launch-time race."""
+    global _ODOC_HANDLER
+    try:
+        from Foundation import NSAppleEventManager
+    except Exception:
+        return
+
+    def fourcc(s):
+        return (ord(s[0]) << 24) | (ord(s[1]) << 16) | (ord(s[2]) << 8) | ord(s[3])
+
+    kCoreEventClass = fourcc("aevt")
+    kAEOpenDocuments = fourcc("odoc")
+    try:
+        cls = _build_odoc_class()
+        first = _ODOC_HANDLER is None
+        if first:
+            _ODOC_HANDLER = cls.alloc().init()
+        NSAppleEventManager.sharedAppleEventManager().setEventHandler_andSelector_forEventClass_andEventID_(
+            _ODOC_HANDLER, "handleAppleEvent:withReplyEvent:", kCoreEventClass, kAEOpenDocuments)
+        if first:
+            print("  Open-document handler installed (double-click opens a new tab).")
+    except Exception as e:  # noqa
+        print("  Could not install open-document handler:", e)
+
+
+def _idle_watchdog():
     """Quit the process once every browser tab has been closed for a while, so
     a closed app stops consuming memory/CPU. A heartbeat (any /api/ping) keeps
     it alive; the existing tab poller pings every few seconds while open."""
@@ -3425,6 +4302,36 @@ def _idle_watchdog(server):
                 os._exit(0)
 
 
+_CONFIG_DEFAULTS = {"win_w": 1200, "win_h": 820}
+
+def _config_path():
+    base = os.path.expanduser("~/Library/Application Support/PyPDF for Mac")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        base = tempfile.gettempdir()
+    return os.path.join(base, "settings.json")
+
+def _load_config():
+    try:
+        with open(_config_path(), encoding="utf-8") as fh:
+            d = json.load(fh)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _save_config(patch):
+    try:
+        cur = _load_config()
+        cur.update(patch)
+        tmp = _config_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cur, fh)
+        os.replace(tmp, _config_path())
+    except Exception:
+        pass
+
+
 def main():
     pdf_path = _argv_pdf()
 
@@ -3438,16 +4345,17 @@ def main():
                       f"(port {running}).")
             except Exception as e:  # noqa
                 print(f"  Could not reach the running editor: {e}")
-        # Always surface a browser tab pointed at the running server — even if
-        # every window/tab was closed (e.g. Safari was quit). Without this, a
-        # double-clicked PDF gets handed off but nothing visible opens.
-        webbrowser.open(f"http://{HOST}:{running}")
+        # The running instance owns the native window; just bring it to the
+        # front. Its tab strip will pick up the handed-off file (it polls
+        # /api/tabs when tabs_rev changes). No browser tab is opened.
+        _focus_running_app()
         return
 
     # ---- otherwise we become the single server instance ---------------------
     if pdf_path:
         try:
             with open(pdf_path, "rb") as fh:
+                bind_tab(_new_tab_id(), create=True)   # first document → first tab
                 STATE.open_bytes(fh.read(), os.path.basename(pdf_path), path=pdf_path)
             print(f"  Loaded: {pdf_path}")
         except Exception as e:  # noqa
@@ -3455,6 +4363,9 @@ def main():
 
     port = find_free_port(PORT)
     url = f"http://{HOST}:{port}"
+    # The boot secret authorises loading "/" (which embeds the CSRF token);
+    # only the window we open ourselves knows it.
+    boot_url = f"{url}/?boot={PAGE_BOOT}"
     server = ThreadingHTTPServer((HOST, port), Handler)
     # Write the hand-off secret so a later launch can authorise /api/open_path.
     try:
@@ -3469,18 +4380,94 @@ def main():
     print("=" * 56)
     print("  PyPDF for Mac is running")
     print(f"  PyMuPDF {getattr(fitz, 'VersionBind', '?')}")
-    print(f"  Open in your browser:  {url}")
-    print("  Press Ctrl+C here to stop.")
+    print(f"  Local server:  {url}")
     print("=" * 56)
-    # Open the browser as soon as the socket is accepting connections.
-    threading.Thread(target=lambda: (time.sleep(0.2), webbrowser.open(url)), daemon=True).start()
-    # Auto-shutdown when the browser is closed (frees memory/CPU).
-    threading.Thread(target=_idle_watchdog, args=(server,), daemon=True).start()
+    # ---- present the UI in a native window (pywebview), not a browser -------
+    # pywebview wraps macOS WKWebView, giving the app its own window with no
+    # browser chrome and no visible localhost URL. It MUST run on the main
+    # thread, so the HTTP server moves to a background thread. If pywebview
+    # isn't available we fall back to the default browser so the app still works.
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down. Bye!")
-        server.shutdown()
+        import webview  # pywebview
+        _have_webview = True
+    except Exception:
+        _have_webview = False
+
+    # Heartbeat-based auto-shutdown is only for BROWSER mode, where there is no
+    # reliable close signal. In native mode the process lifetime is tied to the
+    # window itself (webview.start() returns when it closes) — a throttled
+    # WKWebView timer (App Nap / occlusion) must never kill a live window.
+    if not _have_webview:
+        threading.Thread(target=_idle_watchdog, daemon=True).start()
+
+    if _have_webview:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _cfg = _load_config()
+        _w = max(900, int(_cfg.get("win_w", _CONFIG_DEFAULTS["win_w"]) or _CONFIG_DEFAULTS["win_w"]))
+        _h = max(600, int(_cfg.get("win_h", _CONFIG_DEFAULTS["win_h"]) or _CONFIG_DEFAULTS["win_h"]))
+        _win = webview.create_window(
+            "PyPDF for Mac", boot_url,
+            width=_w, height=_h, min_size=(900, 600),
+            js_api=NATIVE_API,   # native Save / PNG / Copy / Print bridge
+        )
+        # Remember the window size across launches. pywebview fires `resized`
+        # with the new (width, height); we persist the latest values. Guarded so
+        # an older pywebview without the event simply keeps the default size.
+        def _on_resized(width, height):
+            try:
+                _save_config({"win_w": int(width), "win_h": int(height)})
+            except Exception:
+                pass
+        try:
+            _win.events.resized += _on_resized
+        except Exception:
+            pass
+        # Unsaved-changes guard: WKWebView ignores the page's beforeunload, so
+        # closing the window would silently discard edits. Veto the close and
+        # confirm with a native dialog when any open tab has unsaved changes.
+        def _dirty_names():
+            with STATE_LOCK:
+                return [st.filename for st in DOCS.values()
+                        if st.dirty and st.doc is not None]
+
+        def _on_closing():
+            try:
+                names = _dirty_names()
+                if not names:
+                    return True
+                shown = ", ".join("“%s”" % n for n in names[:3])
+                if len(names) > 3:
+                    shown += " and %d more" % (len(names) - 3)
+                verb = "has" if len(names) == 1 else "have"
+                return bool(_win.create_confirmation_dialog(
+                    "Unsaved changes",
+                    "%s %s unsaved changes.\n\n"
+                    "Close anyway and discard them?" % (shown, verb)))
+            except Exception:
+                return True   # never trap the user in an uncloseable window
+        try:
+            _win.events.closing += _on_closing
+        except Exception:
+            pass
+        # Install the macOS open-document handler AFTER the GUI loop starts, so
+        # it overrides AppKit's default odoc handler (installed during app launch,
+        # which would otherwise win and show "cannot open files in PDF format").
+        # Re-register a few times over the first few seconds to win the race.
+        def _post_start(*_a):
+            for _ in range(8):
+                time.sleep(0.5)
+                _install_open_file_handler()
+        webview.start(_post_start)   # blocks until the native window is closed
+        os._exit(0)            # window closed → stop the server and quit
+    else:
+        print("  (pywebview not found — opening in your default browser)")
+        print(f"  If it doesn't open, visit: {boot_url}")
+        threading.Thread(target=lambda: (time.sleep(0.2), webbrowser.open(boot_url)), daemon=True).start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down. Bye!")
+            server.shutdown()
 
 
 if __name__ == "__main__":

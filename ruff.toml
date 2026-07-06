@@ -1,0 +1,14 @@
+# Lint configuration for PyPDF for Mac. Run: ruff check .
+line-length = 120
+target-version = "py310"
+extend-exclude = ["restore_points", ".build_venv", ".venv", "build", "dist"]
+
+[lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",   # long lines — the embedded HTML/JS block has many, intentionally
+    "E402",   # imports after the pymupdf bootstrap block are deliberate
+    "E701",   # multiple statements on one line (compact pixel loops)
+    "E702",   # statement separators in compact numeric code
+    "E741",   # short loop names in geometry code
+]
